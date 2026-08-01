@@ -1,0 +1,16 @@
+{
+  "name": "pos-print-agent",
+  "version": "2.0.2",
+  "private": true,
+  "description": "Runs on a local PC in the restaurant. Polls for print jobs over HTTP and prints them to LAN thermal printers, with printer IPs configurable from the admin web UI.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@napi-rs/canvas": "^0.1.53",
+    "dotenv": "^16.4.5",
+    "node-fetch": "^2.7.0",
+    "node-thermal-printer": "^4.4.4"
+  }
+}
