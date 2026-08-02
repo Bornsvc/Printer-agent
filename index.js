@@ -1,7 +1,7 @@
 require('dotenv').config()
 const fetch = require('node-fetch')
 const { renderReceiptImage, renderKotImage } = require('./render')
-const { printReceiptImage, printKotImage, ready } = require('./printer')
+const { printReceiptImage, printKotImage, openCashDrawer, ready } = require('./printer')
 
 const API_URL = process.env.API_URL
 const AGENT_SECRET = process.env.AGENT_SECRET
@@ -27,9 +27,16 @@ async function handleJob(job) {
     if (job.type === 'RECEIPT') {
       const image = renderReceiptImage(payload)
       await printReceiptImage(image)
+      try {
+        await openCashDrawer()
+      } catch (err) {
+        console.warn(`⚠️  Receipt printed but drawer open failed for job ${job.id}:`, err.message)
+      }
     } else if (job.type === 'KOT') {
       const image = renderKotImage(payload)
       await printKotImage(payload.station, image)
+    } else if (job.type === 'DRAWER') {
+      await openCashDrawer()
     } else {
       throw new Error(`Unknown job type: ${job.type}`)
     }

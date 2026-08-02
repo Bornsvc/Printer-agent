@@ -80,4 +80,21 @@ async function printKotImage(station, imageBuffer) {
   await printImageBufferToStation(station, imageBuffer)
 }
 
-module.exports = { printReceiptImage, printKotImage, ready }
+// The cash drawer is wired to the RECEIPT printer's drawer-kick (DK) port —
+// opening it is just a pulse command, no image involved.
+async function openCashDrawer() {
+  const target = printerCache['RECEIPT']
+  if (!target) {
+    throw new Error(`ບໍ່ໄດ້ຕັ້ງຄ່າ IP ໃຫ້ RECEIPT — ໄປຕັ້ງໃນ /admin/printers`)
+  }
+
+  try {
+    const printer = createPrinterForTarget(target)
+    printer.openCashDrawer()
+    await printer.execute()
+  } catch (err) {
+    throw new Error(`Drawer open failed for RECEIPT (${target.ip}:${target.port}): ${err.message}`)
+  }
+}
+
+module.exports = { printReceiptImage, printKotImage, openCashDrawer, ready }
