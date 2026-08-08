@@ -58,7 +58,7 @@ function renderReceiptImage(data) {
   drawLine(ctx, y, new Date().toLocaleString('lo-LA'), { size: 18, align: 'center' })
   y += LINE_HEIGHT
   drawDivider(ctx, y)
-  y += 16
+  y += 25
 
   for (const line of data.lines) {
     drawLine(ctx, y, `${line.quantity}x ${line.name}`, { align: 'left' })
@@ -67,7 +67,7 @@ function renderReceiptImage(data) {
   }
 
   drawDivider(ctx, y)
-  y += 16
+  y += 25
   drawLine(ctx, y, 'รวมย่อย', { align: 'left' })
   drawLine(ctx, y, data.subtotal.toLocaleString(), { align: 'right' })
   y += LINE_HEIGHT
@@ -85,32 +85,47 @@ function renderReceiptImage(data) {
 }
 
 function renderKotImage(data) {
-  const lineCount = data.items.length * 2 + 6
-  const height = LINE_HEIGHT * lineCount + 30
+  // Height must match content exactly — a flat per-item line-count estimate
+  // (e.g. always reserving a note line) leaves blank paper at the bottom of
+  // every ticket. So layout runs as a dry pass first (no canvas yet, just
+  // tracking y) to get the exact height, then a second pass draws using the
+  // positions recorded in `ops` — the two passes can't drift apart since the
+  // draw pass never recomputes a position, only replays what the dry pass logged.
+  const ops = []
+  let y = 36
+
+  ops.push({ y, text: `โต๊ะ ${data.tableNumber}`, opts: { size: 28, bold: true, align: 'center' } })
+  y += LINE_HEIGHT + 4
+
+  if (data.station) {
+    ops.push({ y, text: data.station, opts: { size: 20, align: 'center' } })
+    y += LINE_HEIGHT
+  }
+
+  ops.push({ y, text: new Date().toLocaleString('lo-LA'), opts: { size: 16, align: 'center' } })
+  y += LINE_HEIGHT
+
+  ops.push({ divider: true, y })
+  y += 25
+
+  for (const item of data.items) {
+    ops.push({ y, text: `${item.quantity}x ${item.name}`, opts: { size: 24, bold: true } })
+    y += LINE_HEIGHT
+    if (item.note) {
+      ops.push({ y, text: `  * ${item.note}`, opts: { size: 18 } })
+      y += LINE_HEIGHT
+    }
+  }
+
+  const height = y + 20
   const canvas = createCanvas(WIDTH, height)
   const ctx = canvas.getContext('2d')
   ctx.fillStyle = '#fff'
   ctx.fillRect(0, 0, WIDTH, height)
 
-  let y = 36
-  drawLine(ctx, y, `โต๊ะ ${data.tableNumber}`, { size: 28, bold: true, align: 'center' })
-  y += LINE_HEIGHT + 4
-  if (data.station) {
-    drawLine(ctx, y, data.station, { size: 20, align: 'center' })
-    y += LINE_HEIGHT
-  }
-  drawLine(ctx, y, new Date().toLocaleString('lo-LA'), { size: 16, align: 'center' })
-  y += LINE_HEIGHT
-  drawDivider(ctx, y)
-  y += 16
-
-  for (const item of data.items) {
-    drawLine(ctx, y, `${item.quantity}x ${item.name}`, { size: 24, bold: true })
-    y += LINE_HEIGHT
-    if (item.note) {
-      drawLine(ctx, y, `  * ${item.note}`, { size: 18 })
-      y += LINE_HEIGHT
-    }
+  for (const op of ops) {
+    if (op.divider) drawDivider(ctx, op.y)
+    else drawLine(ctx, op.y, op.text, op.opts)
   }
 
   return canvas.toBuffer('image/png')
