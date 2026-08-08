@@ -28,7 +28,12 @@ async function refreshPrinterConfig() {
 
     const next = {}
     for (const p of data.printers) {
-      if (p.ipAddress) next[p.station] = { ip: p.ipAddress, port: p.port }
+      const connectionType = p.connectionType === 'USB' ? 'USB' : 'LAN'
+      if (connectionType === 'USB') {
+        if (p.printerName) next[p.station] = { connectionType, printerName: p.printerName }
+      } else if (p.ipAddress) {
+        next[p.station] = { connectionType, ip: p.ipAddress, port: p.port }
+      }
     }
     printerCache = next
     console.log('🔄 Printer config refreshed:', Object.keys(printerCache).join(', '))
@@ -46,9 +51,18 @@ setInterval(refreshPrinterConfig, 60_000)
 function createPrinterForTarget(target) {
   return new ThermalPrinter({
     type: PrinterTypes.EPSON,
-    interface: `tcp://${target.ip}:${target.port}`,
+    interface:
+      target.connectionType === 'USB'
+        ? `printer:${target.printerName}`
+        : `tcp://${target.ip}:${target.port}`,
     options: { timeout: 5000 },
   })
+}
+
+// USB targets have no ip/port, LAN targets have no printerName — this picks
+// whichever description makes sense so error messages point at the right thing.
+function describeTarget(target) {
+  return target.connectionType === 'USB' ? `USB "${target.printerName}"` : `${target.ip}:${target.port}`
 }
 
 async function printImageBufferToStation(station, imageBuffer) {
@@ -66,7 +80,7 @@ async function printImageBufferToStation(station, imageBuffer) {
     printer.cut()
     await printer.execute()
   } catch (err) {
-    throw new Error(`Print failed for ${station} (${target.ip}:${target.port}): ${err.message}`)
+    throw new Error(`Print failed for ${station} (${describeTarget(target)}): ${err.message}`)
   } finally {
     fs.unlink(tmpPath, () => {})
   }
@@ -93,7 +107,7 @@ async function openCashDrawer() {
     printer.openCashDrawer()
     await printer.execute()
   } catch (err) {
-    throw new Error(`Drawer open failed for RECEIPT (${target.ip}:${target.port}): ${err.message}`)
+    throw new Error(`Drawer open failed for RECEIPT (${describeTarget(target)}): ${err.message}`)
   }
 }
 
