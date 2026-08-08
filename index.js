@@ -116,7 +116,7 @@ async function handleJob(job) {
         const image = renderKotImage(payload)
         await retryForever(() => printKotImage(payload.station, image), `KOT print for job ${job.id}`)
       } else if (job.type === 'DRAWER') {
-        await retryForever(() => openCashDrawer(), `Drawer open for job ${job.id}`)
+        await openCashDrawer()
       } else {
         throw new Error(`Unknown job type: ${job.type}`)
       }
