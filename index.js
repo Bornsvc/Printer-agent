@@ -59,26 +59,51 @@ async function ackJob(jobId, status, error) {
   })
 }
 
+// Physical printers can only handle one job at a time — two concurrent TCP
+// connections writing to the same printer interleave their raw ESC/POS bytes
+// and corrupt each other (each job's own execute() still resolves fine, since
+// the corruption happens on the printer's side, invisible to this process —
+// that's why jobs can show PRINTED in the DB while only one paper comes out).
+// This queues jobs per physical printer so same-station jobs run strictly
+// one-after-another, while different stations still print in parallel.
+const stationTails = new Map()
+
+function runOnStationQueue(station, fn) {
+  const tail = stationTails.get(station) ?? Promise.resolve()
+  const result = tail.then(fn, fn)
+  stationTails.set(station, result.catch(() => {}))
+  return result
+}
+
+// RECEIPT and DRAWER jobs both target the RECEIPT printer specifically —
+// they must serialize against each other too, not just against themselves.
+function stationKeyFor(job, payload) {
+  if (job.type === 'KOT') return payload.station
+  return 'RECEIPT'
+}
+
 async function handleJob(job) {
   try {
     const payload = JSON.parse(job.payload)
 
-    if (job.type === 'RECEIPT') {
-      const image = renderReceiptImage(payload)
-      await retryForever(() => printReceiptImage(image), `Receipt print for job ${job.id}`)
-      try {
-        await retryBounded(() => openCashDrawer(), `Drawer open for job ${job.id}`, DRAWER_RETRIES)
-      } catch (err) {
-        console.warn(`⚠️  Receipt printed but drawer open failed for job ${job.id}:`, err.message)
+    await runOnStationQueue(stationKeyFor(job, payload), async () => {
+      if (job.type === 'RECEIPT') {
+        const image = renderReceiptImage(payload)
+        await retryForever(() => printReceiptImage(image), `Receipt print for job ${job.id}`)
+        try {
+          await retryBounded(() => openCashDrawer(), `Drawer open for job ${job.id}`, DRAWER_RETRIES)
+        } catch (err) {
+          console.warn(`⚠️  Receipt printed but drawer open failed for job ${job.id}:`, err.message)
+        }
+      } else if (job.type === 'KOT') {
+        const image = renderKotImage(payload)
+        await retryForever(() => printKotImage(payload.station, image), `KOT print for job ${job.id}`)
+      } else if (job.type === 'DRAWER') {
+        await retryForever(() => openCashDrawer(), `Drawer open for job ${job.id}`)
+      } else {
+        throw new Error(`Unknown job type: ${job.type}`)
       }
-    } else if (job.type === 'KOT') {
-      const image = renderKotImage(payload)
-      await retryForever(() => printKotImage(payload.station, image), `KOT print for job ${job.id}`)
-    } else if (job.type === 'DRAWER') {
-      await retryForever(() => openCashDrawer(), `Drawer open for job ${job.id}`)
-    } else {
-      throw new Error(`Unknown job type: ${job.type}`)
-    }
+    })
 
     await ackJob(job.id, 'PRINTED')
     console.log(`✅ Printed job ${job.id} (${job.type})`)
