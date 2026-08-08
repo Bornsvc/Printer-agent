@@ -30,7 +30,7 @@ async function refreshPrinterConfig() {
     for (const p of data.printers) {
       const connectionType = p.connectionType === 'USB' ? 'USB' : 'LAN'
       if (connectionType === 'USB') {
-        if (p.printerName) next[p.station] = { connectionType, printerName: p.printerName }
+        if (p.comPort) next[p.station] = { connectionType, comPort: p.comPort }
       } else if (p.ipAddress) {
         next[p.station] = { connectionType, ip: p.ipAddress, port: p.port }
       }
@@ -51,19 +51,66 @@ setInterval(refreshPrinterConfig, 60_000)
 function createPrinterForTarget(target) {
   return new ThermalPrinter({
     type: PrinterTypes.EPSON,
+    // USB: node-thermal-printer falls through to its File interface for any
+    // string that isn't tcp://... or printer:..., so a raw Windows device
+    // path (\\.\COM3) is written to directly — no native driver needed.
     interface:
       target.connectionType === 'USB'
-        ? `printer:${target.printerName}`
+        ? `\\\\.\\${target.comPort}`
         : `tcp://${target.ip}:${target.port}`,
     options: { timeout: 5000 },
   })
 }
 
-// USB targets have no ip/port, LAN targets have no printerName — this picks
+// USB targets have no ip/port, LAN targets have no comPort — this picks
 // whichever description makes sense so error messages point at the right thing.
 function describeTarget(target) {
-  return target.connectionType === 'USB' ? `USB "${target.printerName}"` : `${target.ip}:${target.port}`
+  return target.connectionType === 'USB' ? `USB ${target.comPort}` : `${target.ip}:${target.port}`
 }
+
+const HEALTH_CHECK_INTERVAL_MS = 30_000
+
+// Periodic liveness probe — separate from actual printing, so staff can see
+// which printers are reachable without waiting for a real job to fail. LAN
+// targets get a real TCP connect/close via node-thermal-printer's
+// isPrinterConnected(). USB targets can't be verified without printing, so
+// they report UNKNOWN — the server only lets that fill in a never-checked
+// station, never overwrite a real ONLINE/OFFLINE set by an actual print-job
+// outcome (see app/api/printer-status in the Next.js app).
+async function checkAllPrinters() {
+  const entries = Object.entries(printerCache)
+  if (entries.length === 0) return
+
+  const results = await Promise.all(
+    entries.map(async ([station, target]) => {
+      if (target.connectionType === 'USB') {
+        return { station, status: 'UNKNOWN' }
+      }
+      const printer = createPrinterForTarget(target)
+      const connected = await printer.isPrinterConnected()
+      return connected
+        ? { station, status: 'ONLINE' }
+        : { station, status: 'OFFLINE', error: `Could not connect to ${describeTarget(target)}` }
+    })
+  )
+
+  try {
+    const res = await fetch(`${API_URL}/api/printer-status`, {
+      method: 'POST',
+      headers: { 'x-agent-key': AGENT_SECRET, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ results }),
+    })
+    if (!res.ok) throw new Error(`Status POST failed: ${res.status}`)
+  } catch (err) {
+    console.error('⚠️  Could not report printer health:', err.message)
+  }
+}
+
+// Wait for the first config load so this doesn't run against an empty cache.
+ready.then(() => {
+  checkAllPrinters()
+  setInterval(checkAllPrinters, HEALTH_CHECK_INTERVAL_MS)
+})
 
 async function printImageBufferToStation(station, imageBuffer) {
   const target = printerCache[station]
