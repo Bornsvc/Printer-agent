@@ -9,6 +9,7 @@ const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS) || 3000
 const PRINT_RETRY_DELAY_MS = Number(process.env.PRINT_RETRY_DELAY_MS) || 3000
 const PRINT_RETRY_MAX_DELAY_MS = Number(process.env.PRINT_RETRY_MAX_DELAY_MS) || 60000
 const DRAWER_RETRIES = Number(process.env.DRAWER_RETRIES) || 3
+const PRINT_GAP_MS = Number(process.env.PRINT_GAP_MS) || 1000
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -66,12 +67,26 @@ async function ackJob(jobId, status, error) {
 // that's why jobs can show PRINTED in the DB while only one paper comes out).
 // This queues jobs per physical printer so same-station jobs run strictly
 // one-after-another, while different stations still print in parallel.
+//
+// execute() resolving only means the bytes were handed to the OS socket — it
+// does NOT mean the printer has finished physically feeding/cutting the
+// paper. Starting the next job's TCP connection while the printer is still
+// mid-cut can still corrupt/drop it even though nothing overlapped in Node.
+// PRINT_GAP_MS is a cooldown enforced between jobs on the same station to
+// give the printer time to finish before the next one starts.
 const stationTails = new Map()
 
 function runOnStationQueue(station, fn) {
   const tail = stationTails.get(station) ?? Promise.resolve()
   const result = tail.then(fn, fn)
-  stationTails.set(station, result.catch(() => {}))
+  const nextTail = result.then(
+    () => {
+      console.log(`⏳ ${station}: job done, waiting ${PRINT_GAP_MS}ms before next in queue`)
+      return sleep(PRINT_GAP_MS)
+    },
+    () => sleep(PRINT_GAP_MS)
+  )
+  stationTails.set(station, nextTail.catch(() => {}))
   return result
 }
 
@@ -85,8 +100,10 @@ function stationKeyFor(job, payload) {
 async function handleJob(job) {
   try {
     const payload = JSON.parse(job.payload)
+    const station = stationKeyFor(job, payload)
 
-    await runOnStationQueue(stationKeyFor(job, payload), async () => {
+    await runOnStationQueue(station, async () => {
+      console.log(`🖨️  ${station}: starting job ${job.id} (${job.type})`)
       if (job.type === 'RECEIPT') {
         const image = renderReceiptImage(payload)
         await retryForever(() => printReceiptImage(image), `Receipt print for job ${job.id}`)
