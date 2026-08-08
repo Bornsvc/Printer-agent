@@ -6,6 +6,45 @@ const { printReceiptImage, printKotImage, openCashDrawer, ready } = require('./p
 const API_URL = process.env.API_URL
 const AGENT_SECRET = process.env.AGENT_SECRET
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS) || 3000
+const PRINT_RETRY_DELAY_MS = Number(process.env.PRINT_RETRY_DELAY_MS) || 3000
+const PRINT_RETRY_MAX_DELAY_MS = Number(process.env.PRINT_RETRY_MAX_DELAY_MS) || 60000
+const DRAWER_RETRIES = Number(process.env.DRAWER_RETRIES) || 3
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+// Retries a job's primary print action forever (backoff capped at
+// PRINT_RETRY_MAX_DELAY_MS) so a printer that's genuinely down doesn't
+// permanently fail the job — it just keeps trying until the printer comes
+// back online. Never throws, so callers never mark the job FAILED for this.
+async function retryForever(fn, label) {
+  let attempt = 0
+  while (true) {
+    attempt++
+    try {
+      return await fn()
+    } catch (err) {
+      const delay = Math.min(PRINT_RETRY_DELAY_MS * attempt, PRINT_RETRY_MAX_DELAY_MS)
+      console.warn(`⚠️  ${label} failed (attempt ${attempt}): ${err.message} — retrying in ${delay / 1000}s`)
+      await sleep(delay)
+    }
+  }
+}
+
+// Bounded retry for best-effort sub-actions (the drawer kick after a receipt
+// prints) that shouldn't hold up acking the job forever if it never opens.
+async function retryBounded(fn, label, retries) {
+  let lastErr
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      return await fn()
+    } catch (err) {
+      lastErr = err
+      console.warn(`⚠️  ${label} failed (attempt ${attempt}/${retries}): ${err.message}`)
+      if (attempt < retries) await sleep(PRINT_RETRY_DELAY_MS)
+    }
+  }
+  throw lastErr
+}
 
 if (!API_URL || !AGENT_SECRET) {
   console.error('❌ Missing required .env values — copy .env.example to .env and fill it in.')
@@ -21,22 +60,22 @@ async function ackJob(jobId, status, error) {
 }
 
 async function handleJob(job) {
-  const payload = JSON.parse(job.payload)
-
   try {
+    const payload = JSON.parse(job.payload)
+
     if (job.type === 'RECEIPT') {
       const image = renderReceiptImage(payload)
-      await printReceiptImage(image)
+      await retryForever(() => printReceiptImage(image), `Receipt print for job ${job.id}`)
       try {
-        await openCashDrawer()
+        await retryBounded(() => openCashDrawer(), `Drawer open for job ${job.id}`, DRAWER_RETRIES)
       } catch (err) {
         console.warn(`⚠️  Receipt printed but drawer open failed for job ${job.id}:`, err.message)
       }
     } else if (job.type === 'KOT') {
       const image = renderKotImage(payload)
-      await printKotImage(payload.station, image)
+      await retryForever(() => printKotImage(payload.station, image), `KOT print for job ${job.id}`)
     } else if (job.type === 'DRAWER') {
-      await openCashDrawer()
+      await retryForever(() => openCashDrawer(), `Drawer open for job ${job.id}`)
     } else {
       throw new Error(`Unknown job type: ${job.type}`)
     }
@@ -49,9 +88,14 @@ async function handleJob(job) {
   }
 }
 
-// Prevents a slow print job from overlapping with the next tick's fetch,
-// which would otherwise process (and print) the same pending job twice.
+// Guards only the fetch itself against overlapping with the next tick.
 let pollInProgress = false
+
+// Jobs currently being printed (possibly mid-retryForever, which can run for
+// a long time). Dispatched without awaiting so a stuck job at one station
+// can't block polling or other stations' jobs — tracked here instead so the
+// next tick's fetch doesn't pick up and re-dispatch the same pending job.
+const inFlightJobIds = new Set()
 
 async function poll() {
   if (pollInProgress) return
@@ -63,7 +107,11 @@ async function poll() {
     if (!res.ok) throw new Error(`Poll fetch failed: ${res.status}`)
     const data = await res.json()
     for (const job of data.jobs) {
-      await handleJob(job)
+      if (inFlightJobIds.has(job.id)) continue
+      inFlightJobIds.add(job.id)
+      handleJob(job)
+        .catch((err) => console.error(`Unexpected error handling job ${job.id}:`, err.message))
+        .finally(() => inFlightJobIds.delete(job.id))
     }
   } catch (err) {
     console.error('Poll error:', err.message)

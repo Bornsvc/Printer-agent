@@ -99,7 +99,7 @@ function renderKotImage(data) {
     drawLine(ctx, y, data.station, { size: 20, align: 'center' })
     y += LINE_HEIGHT
   }
-  drawLine(ctx, y, new Date().toLocaleTimeString('lo-LA'), { size: 16, align: 'center' })
+  drawLine(ctx, y, new Date().toLocaleString('lo-LA'), { size: 16, align: 'center' })
   y += LINE_HEIGHT
   drawDivider(ctx, y)
   y += 16
