@@ -30,6 +30,35 @@ const WIDTH = 576
 const LINE_HEIGHT = 30
 const MARGIN = 16
 
+// Loads a PNG/JPG that may not exist (logo, payment QR — both optional).
+// img.complete reports true the instant src is set, but drawImage silently
+// paints nothing until decode() actually resolves — so callers must await
+// `ready` before the first receipt is rendered, or the image draws blank.
+function loadImageAsset(assetPath) {
+  const asset = { image: null }
+  asset.ready = (async () => {
+    if (!fs.existsSync(assetPath)) return
+    try {
+      const img = new Image()
+      img.src = fs.readFileSync(assetPath)
+      await img.decode()
+      asset.image = img
+    } catch (err) {
+      console.warn(`⚠️  Failed to load ${path.basename(assetPath)}:`, err.message)
+    }
+  })()
+  return asset
+}
+
+// Scales an image down to maxWidth (never up), preserving aspect ratio —
+// stretching a QR code even slightly can make it fail to scan.
+function scaledDims(image, maxWidth) {
+  if (!image) return null
+  const width = Math.min(image.width, maxWidth)
+  const height = image.height * (width / image.width)
+  return { width, height }
+}
+
 // Optional restaurant logo printed at the top of RECEIPT tickets (not KOTs —
 // kitchen slips stay logo-free to save paper/time). Drop a PNG/JPG at
 // print-agent/assets/logo.png to enable it; receipts print without a logo
@@ -37,30 +66,16 @@ const MARGIN = 16
 const LOGO_PATH = path.join(__dirname, 'assets', 'logo.png')
 const LOGO_MAX_WIDTH = 320
 const LOGO_MARGIN_BOTTOM = 14
+const logo = loadImageAsset(LOGO_PATH)
+const logoReady = logo.ready
 
-let logoImage = null
-// img.complete reports true the instant src is set, but drawImage silently
-// paints nothing until decode() actually resolves — so loading must finish
-// (logoReady) before the first receipt is rendered.
-const logoReady = (async () => {
-  if (!fs.existsSync(LOGO_PATH)) return
-  try {
-    const img = new Image()
-    img.src = fs.readFileSync(LOGO_PATH)
-    await img.decode()
-    logoImage = img
-  } catch (err) {
-    console.warn('⚠️  Failed to load receipt logo:', err.message)
-  }
-})()
-
-// Scales the logo down to LOGO_MAX_WIDTH (never up) preserving aspect ratio.
-function getLogoDims() {
-  if (!logoImage) return null
-  const width = Math.min(logoImage.width, LOGO_MAX_WIDTH)
-  const height = logoImage.height * (width / logoImage.width)
-  return { width, height }
-}
+// Optional payment QR code printed near the total on RECEIPT tickets. Drop a
+// PNG/JPG at print-agent/assets/qr-payment.png to enable it.
+const QR_PATH = path.join(__dirname, 'assets', 'qr-payment.png')
+const QR_MAX_WIDTH = 260
+const QR_MARGIN_TOP = 16
+const qr = loadImageAsset(QR_PATH)
+const qrReady = qr.ready
 
 function drawLine(ctx, y, text, opts = {}) {
   const { size = 22, bold = false, align = 'left' } = opts
@@ -85,12 +100,13 @@ function renderReceiptImage(data) {
   // matches drawn content exactly, no magic line-count formula to keep in
   // sync as lines are added/removed here.
   const ops = []
-  const logo = getLogoDims()
+  const logoDims = scaledDims(logo.image, LOGO_MAX_WIDTH)
+  const qrDims = scaledDims(qr.image, QR_MAX_WIDTH)
   let y = 20
 
-  if (logo) {
-    ops.push({ image: true, x: (WIDTH - logo.width) / 2, y, width: logo.width, height: logo.height })
-    y += logo.height + LOGO_MARGIN_BOTTOM
+  if (logoDims) {
+    ops.push({ image: logo.image, x: (WIDTH - logoDims.width) / 2, y, width: logoDims.width, height: logoDims.height })
+    y += logoDims.height + LOGO_MARGIN_BOTTOM
   }
 
   // The logo already carries the restaurant name/branding as an image, so a
@@ -131,6 +147,14 @@ function renderReceiptImage(data) {
   ops.push({ y, text: 'รวมทั้งหมด', opts: { size: 24, bold: true, align: 'left' } })
   ops.push({ y, text: `฿${data.total.toLocaleString()}`, opts: { size: 24, bold: true, align: 'right' } })
   y += LINE_HEIGHT + 14
+
+  if (qrDims) {
+    ops.push({ y, text: 'สแกนเพื่อชำระเงิน', opts: { size: 18, align: 'center' } })
+    y += LINE_HEIGHT
+    ops.push({ image: qr.image, x: (WIDTH - qrDims.width) / 2, y, width: qrDims.width, height: qrDims.height })
+    y += qrDims.height + QR_MARGIN_TOP
+  }
+
   ops.push({ y, text: 'ขอบคุณที่ใช้บริการ', opts: { size: 18, align: 'center' } })
   y += 8
 
@@ -141,7 +165,7 @@ function renderReceiptImage(data) {
   ctx.fillRect(0, 0, WIDTH, height)
 
   for (const op of ops) {
-    if (op.image) ctx.drawImage(logoImage, op.x, op.y, op.width, op.height)
+    if (op.image) ctx.drawImage(op.image, op.x, op.y, op.width, op.height)
     else if (op.divider) drawDivider(ctx, op.y)
     else drawLine(ctx, op.y, op.text, op.opts)
   }
@@ -196,4 +220,4 @@ function renderKotImage(data) {
   return canvas.toBuffer('image/png')
 }
 
-module.exports = { renderReceiptImage, renderKotImage, logoReady }
+module.exports = { renderReceiptImage, renderKotImage, logoReady, qrReady }

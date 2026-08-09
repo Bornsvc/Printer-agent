@@ -12,7 +12,7 @@
 require('dotenv').config()
 const path = require('path')
 const fs = require('fs')
-const { renderReceiptImage, logoReady } = require('../render')
+const { renderReceiptImage, logoReady, qrReady } = require('../render')
 const { printReceiptImage, ready } = require('../printer')
 
 const sample = {
@@ -31,8 +31,8 @@ const sample = {
 }
 
 async function main() {
-  console.log('⏳ Loading printer config + logo...')
-  await Promise.all([ready, logoReady])
+  console.log('⏳ Loading printer config + logo + QR...')
+  await Promise.all([ready, logoReady, qrReady])
 
   console.log('🖼  Rendering receipt image...')
   const image = renderReceiptImage(sample)
