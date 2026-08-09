@@ -1,6 +1,6 @@
 require('dotenv').config()
 const fetch = require('node-fetch')
-const { renderReceiptImage, renderKotImage } = require('./render')
+const { renderReceiptImage, renderKotImage, logoReady } = require('./render')
 const { printReceiptImage, printKotImage, openCashDrawer, ready } = require('./printer')
 
 const API_URL = process.env.API_URL
@@ -165,6 +165,7 @@ async function poll() {
 async function main() {
   console.log(`🖨️  Print agent starting — polling ${API_URL}`)
   await ready
+  await logoReady
   await poll()
   setInterval(poll, POLL_INTERVAL_MS)
   console.log(`✅ Polling for new print jobs every ${POLL_INTERVAL_MS / 1000}s...`)

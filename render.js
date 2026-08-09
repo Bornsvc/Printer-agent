@@ -1,4 +1,4 @@
-const { createCanvas, GlobalFonts } = require('@napi-rs/canvas')
+const { createCanvas, GlobalFonts, Image } = require('@napi-rs/canvas')
 const path = require('path')
 const fs = require('fs')
 
@@ -24,6 +24,38 @@ const WIDTH = 384 // ~80mm paper at 203dpi
 const LINE_HEIGHT = 30
 const MARGIN = 12
 
+// Optional restaurant logo printed at the top of RECEIPT tickets (not KOTs —
+// kitchen slips stay logo-free to save paper/time). Drop a PNG/JPG at
+// print-agent/assets/logo.png to enable it; receipts print without a logo
+// if the file is missing.
+const LOGO_PATH = path.join(__dirname, 'assets', 'logo.png')
+const LOGO_MAX_WIDTH = 220
+const LOGO_MARGIN_BOTTOM = 14
+
+let logoImage = null
+// img.complete reports true the instant src is set, but drawImage silently
+// paints nothing until decode() actually resolves — so loading must finish
+// (logoReady) before the first receipt is rendered.
+const logoReady = (async () => {
+  if (!fs.existsSync(LOGO_PATH)) return
+  try {
+    const img = new Image()
+    img.src = fs.readFileSync(LOGO_PATH)
+    await img.decode()
+    logoImage = img
+  } catch (err) {
+    console.warn('⚠️  Failed to load receipt logo:', err.message)
+  }
+})()
+
+// Scales the logo down to LOGO_MAX_WIDTH (never up) preserving aspect ratio.
+function getLogoDims() {
+  if (!logoImage) return null
+  const width = Math.min(logoImage.width, LOGO_MAX_WIDTH)
+  const height = logoImage.height * (width / logoImage.width)
+  return { width, height }
+}
+
 function drawLine(ctx, y, text, opts = {}) {
   const { size = 22, bold = false, align = 'left' } = opts
   ctx.font = `${bold ? 'bold ' : ''}${size}px ${FONT_FAMILY}`
@@ -44,13 +76,20 @@ function drawDivider(ctx, y) {
 
 function renderReceiptImage(data) {
   const lineCount = data.lines.length + 8
-  const height = LINE_HEIGHT * lineCount + 40
+  const logo = getLogoDims()
+  const logoSpace = logo ? logo.height + LOGO_MARGIN_BOTTOM : 0
+  const height = LINE_HEIGHT * lineCount + 48 + logoSpace
   const canvas = createCanvas(WIDTH, height)
   const ctx = canvas.getContext('2d')
   ctx.fillStyle = '#fff'
   ctx.fillRect(0, 0, WIDTH, height)
 
-  let y = 36
+  let y = 20
+  if (logo) {
+    ctx.drawImage(logoImage, (WIDTH - logo.width) / 2, y, logo.width, logo.height)
+    y += logo.height + LOGO_MARGIN_BOTTOM
+  }
+  y += 16
   drawLine(ctx, y, data.restaurantName || 'ร้านอาหาร', { size: 28, bold: true, align: 'center' })
   y += LINE_HEIGHT + 6
   drawLine(ctx, y, `โต๊ะ ${data.tableNumber}`, { align: 'center' })
@@ -131,4 +170,4 @@ function renderKotImage(data) {
   return canvas.toBuffer('image/png')
 }
 
-module.exports = { renderReceiptImage, renderKotImage }
+module.exports = { renderReceiptImage, renderKotImage, logoReady }
