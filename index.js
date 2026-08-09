@@ -7,28 +7,32 @@ const API_URL = process.env.API_URL
 const AGENT_SECRET = process.env.AGENT_SECRET
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS) || 3000
 const PRINT_RETRY_DELAY_MS = Number(process.env.PRINT_RETRY_DELAY_MS) || 3000
-const PRINT_RETRY_MAX_DELAY_MS = Number(process.env.PRINT_RETRY_MAX_DELAY_MS) || 60000
 const DRAWER_RETRIES = Number(process.env.DRAWER_RETRIES) || 1
 const PRINT_GAP_MS = Number(process.env.PRINT_GAP_MS) || 2000
+const PRINT_RETRY_ATTEMPTS = Number(process.env.PRINT_RETRY_ATTEMPTS) || 3
+const PRINT_RETRY_WINDOW_MS = Number(process.env.PRINT_RETRY_WINDOW_MS) || 6 * 60 * 1000
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
-// Retries a job's primary print action forever (backoff capped at
-// PRINT_RETRY_MAX_DELAY_MS) so a printer that's genuinely down doesn't
-// permanently fail the job — it just keeps trying until the printer comes
-// back online. Never throws, so callers never mark the job FAILED for this.
-async function retryForever(fn, label) {
-  let attempt = 0
-  while (true) {
-    attempt++
+// Retries a job's primary print action up to PRINT_RETRY_ATTEMPTS times,
+// spread evenly across PRINT_RETRY_WINDOW_MS (default: 3 attempts over 6
+// minutes). If every attempt fails, throws the last error so the caller
+// (handleJob) marks the job FAILED instead of retrying forever — a printer
+// that's genuinely down no longer jams the queue. Staff can requeue the job
+// from /admin/printers once it's back online.
+async function retryPrintAction(fn, label) {
+  const gap = PRINT_RETRY_ATTEMPTS > 1 ? PRINT_RETRY_WINDOW_MS / (PRINT_RETRY_ATTEMPTS - 1) : 0
+  let lastErr
+  for (let attempt = 1; attempt <= PRINT_RETRY_ATTEMPTS; attempt++) {
     try {
       return await fn()
     } catch (err) {
-      const delay = Math.min(PRINT_RETRY_DELAY_MS * attempt, PRINT_RETRY_MAX_DELAY_MS)
-      console.warn(`⚠️  ${label} failed (attempt ${attempt}): ${err.message} — retrying in ${delay / 1000}s`)
-      await sleep(delay)
+      lastErr = err
+      console.warn(`⚠️  ${label} failed (attempt ${attempt}/${PRINT_RETRY_ATTEMPTS}): ${err.message}`)
+      if (attempt < PRINT_RETRY_ATTEMPTS) await sleep(gap)
     }
   }
+  throw lastErr
 }
 
 // Bounded retry for best-effort sub-actions (the drawer kick after a receipt
@@ -106,15 +110,10 @@ async function handleJob(job) {
       console.log(`🖨️  ${station}: starting job ${job.id} (${job.type})`)
       if (job.type === 'RECEIPT') {
         const image = renderReceiptImage(payload)
-        await retryForever(() => printReceiptImage(image), `Receipt print for job ${job.id}`)
-        try {
-          await retryBounded(() => openCashDrawer(), `Drawer open for job ${job.id}`, DRAWER_RETRIES)
-        } catch (err) {
-          console.warn(`⚠️  Receipt printed but drawer open failed for job ${job.id}:`, err.message)
-        }
+        await retryPrintAction(() => printReceiptImage(image), `Receipt print for job ${job.id}`)
       } else if (job.type === 'KOT') {
         const image = renderKotImage(payload)
-        await retryForever(() => printKotImage(payload.station, image), `KOT print for job ${job.id}`)
+        await retryPrintAction(() => printKotImage(payload.station, image), `KOT print for job ${job.id}`)
       } else if (job.type === 'DRAWER') {
         await openCashDrawer()
       } else {
@@ -133,8 +132,8 @@ async function handleJob(job) {
 // Guards only the fetch itself against overlapping with the next tick.
 let pollInProgress = false
 
-// Jobs currently being printed (possibly mid-retryForever, which can run for
-// a long time). Dispatched without awaiting so a stuck job at one station
+// Jobs currently being printed (possibly mid-retryPrintAction, which can run
+// for a few minutes). Dispatched without awaiting so a stuck job at one station
 // can't block polling or other stations' jobs — tracked here instead so the
 // next tick's fetch doesn't pick up and re-dispatch the same pending job.
 const inFlightJobIds = new Set()

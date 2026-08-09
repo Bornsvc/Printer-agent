@@ -20,16 +20,22 @@ if (fs.existsSync(FONT_PATH)) {
   )
 }
 
-const WIDTH = 384 // ~80mm paper at 203dpi
+// 80mm thermal paper prints 576 dots wide at 203dpi (its printable area is
+// ~72mm — the rest is margin the printer itself reserves). ESC/POS image
+// printing does NOT center a narrower image on a wider print head; it just
+// starts at the left edge — so this must match the paper actually loaded, or
+// everything prints hugging the left with dead space on the right. Change to
+// 384 if a station is loaded with 58mm paper instead.
+const WIDTH = 576
 const LINE_HEIGHT = 30
-const MARGIN = 12
+const MARGIN = 16
 
 // Optional restaurant logo printed at the top of RECEIPT tickets (not KOTs —
 // kitchen slips stay logo-free to save paper/time). Drop a PNG/JPG at
 // print-agent/assets/logo.png to enable it; receipts print without a logo
 // if the file is missing.
 const LOGO_PATH = path.join(__dirname, 'assets', 'logo.png')
-const LOGO_MAX_WIDTH = 220
+const LOGO_MAX_WIDTH = 320
 const LOGO_MARGIN_BOTTOM = 14
 
 let logoImage = null
@@ -75,50 +81,70 @@ function drawDivider(ctx, y) {
 }
 
 function renderReceiptImage(data) {
-  const lineCount = data.lines.length + 8
+  // Same dry-layout-then-draw approach as renderKotImage — height always
+  // matches drawn content exactly, no magic line-count formula to keep in
+  // sync as lines are added/removed here.
+  const ops = []
   const logo = getLogoDims()
-  const logoSpace = logo ? logo.height + LOGO_MARGIN_BOTTOM : 0
-  const height = LINE_HEIGHT * lineCount + 48 + logoSpace
+  let y = 20
+
+  if (logo) {
+    ops.push({ image: true, x: (WIDTH - logo.width) / 2, y, width: logo.width, height: logo.height })
+    y += logo.height + LOGO_MARGIN_BOTTOM
+  }
+
+  // The logo already carries the restaurant name/branding as an image, so a
+  // plain-text name line is only drawn if the caller explicitly passes one
+  // (e.g. a future settings-driven name) — skipped by default, which also
+  // sidesteps needing that string to be in a script this font covers.
+  if (data.restaurantName) {
+    ops.push({ y, text: data.restaurantName, opts: { size: 22, bold: true, align: 'center' } })
+    y += LINE_HEIGHT + 6
+  }
+
+  // Table number is the thing staff actually scan for when matching a
+  // printed receipt to a bill, so it's the largest, boldest line on the page.
+  ops.push({ y, text: `โต๊ะ ${data.tableNumber}`, opts: { size: 30, bold: true, align: 'center' } })
+  y += LINE_HEIGHT + 6
+  ops.push({ y, text: new Date().toLocaleString('lo-LA'), opts: { size: 16, align: 'center' } })
+  y += LINE_HEIGHT
+
+  ops.push({ divider: true, y })
+  y += 25
+
+  for (const line of data.lines) {
+    ops.push({ y, text: `${line.quantity}x ${line.name}`, opts: { align: 'left' } })
+    ops.push({ y, text: line.lineTotal.toLocaleString(), opts: { align: 'right' } })
+    y += LINE_HEIGHT
+  }
+
+  ops.push({ divider: true, y })
+  y += 25
+  ops.push({ y, text: 'รวมย่อย', opts: { align: 'left' } })
+  ops.push({ y, text: `฿${data.subtotal.toLocaleString()}`, opts: { align: 'right' } })
+  y += LINE_HEIGHT
+  if (data.serviceCharge > 0) {
+    ops.push({ y, text: 'ค่าบริการ', opts: { align: 'left' } })
+    ops.push({ y, text: `฿${data.serviceCharge.toLocaleString()}`, opts: { align: 'right' } })
+    y += LINE_HEIGHT
+  }
+  ops.push({ y, text: 'รวมทั้งหมด', opts: { size: 24, bold: true, align: 'left' } })
+  ops.push({ y, text: `฿${data.total.toLocaleString()}`, opts: { size: 24, bold: true, align: 'right' } })
+  y += LINE_HEIGHT + 14
+  ops.push({ y, text: 'ขอบคุณที่ใช้บริการ', opts: { size: 18, align: 'center' } })
+  y += 8
+
+  const height = y + 20
   const canvas = createCanvas(WIDTH, height)
   const ctx = canvas.getContext('2d')
   ctx.fillStyle = '#fff'
   ctx.fillRect(0, 0, WIDTH, height)
 
-  let y = 20
-  if (logo) {
-    ctx.drawImage(logoImage, (WIDTH - logo.width) / 2, y, logo.width, logo.height)
-    y += logo.height + LOGO_MARGIN_BOTTOM
+  for (const op of ops) {
+    if (op.image) ctx.drawImage(logoImage, op.x, op.y, op.width, op.height)
+    else if (op.divider) drawDivider(ctx, op.y)
+    else drawLine(ctx, op.y, op.text, op.opts)
   }
-  y += 16
-  drawLine(ctx, y, data.restaurantName || 'ร้านอาหาร', { size: 28, bold: true, align: 'center' })
-  y += LINE_HEIGHT + 6
-  drawLine(ctx, y, `โต๊ะ ${data.tableNumber}`, { align: 'center' })
-  y += LINE_HEIGHT
-  drawLine(ctx, y, new Date().toLocaleString('lo-LA'), { size: 18, align: 'center' })
-  y += LINE_HEIGHT
-  drawDivider(ctx, y)
-  y += 25
-
-  for (const line of data.lines) {
-    drawLine(ctx, y, `${line.quantity}x ${line.name}`, { align: 'left' })
-    drawLine(ctx, y, line.lineTotal.toLocaleString(), { align: 'right' })
-    y += LINE_HEIGHT
-  }
-
-  drawDivider(ctx, y)
-  y += 25
-  drawLine(ctx, y, 'รวมย่อย', { align: 'left' })
-  drawLine(ctx, y, data.subtotal.toLocaleString(), { align: 'right' })
-  y += LINE_HEIGHT
-  if (data.serviceCharge > 0) {
-    drawLine(ctx, y, 'ค่าบริการ', { align: 'left' })
-    drawLine(ctx, y, data.serviceCharge.toLocaleString(), { align: 'right' })
-    y += LINE_HEIGHT
-  }
-  drawLine(ctx, y, 'รวมทั้งหมด', { size: 24, bold: true, align: 'left' })
-  drawLine(ctx, y, `K${data.total.toLocaleString()}`, { size: 24, bold: true, align: 'right' })
-  y += LINE_HEIGHT + 10
-  drawLine(ctx, y, 'ขอบคุณที่ใช้บริการ', { size: 18, align: 'center' })
 
   return canvas.toBuffer('image/png')
 }
