@@ -148,6 +148,20 @@ function renderReceiptImage(data) {
   ops.push({ y, text: `฿${data.total.toLocaleString()}`, opts: { size: 24, bold: true, align: 'right' } })
   y += LINE_HEIGHT + 14
 
+  // Only present on the reprint fired after payment is confirmed (see
+  // closeBillAndTable/enqueueReceipt) — the pre-payment "① Print bill" job
+  // never sets these, so this block is skipped there.
+  if (data.received != null) {
+    ops.push({ divider: true, y })
+    y += 25
+    ops.push({ y, text: 'รับเงิน', opts: { align: 'left' } })
+    ops.push({ y, text: `฿${data.received.toLocaleString()}`, opts: { align: 'right' } })
+    y += LINE_HEIGHT
+    ops.push({ y, text: 'เงินทอน', opts: { align: 'left' } })
+    ops.push({ y, text: `฿${data.change.toLocaleString()}`, opts: { align: 'right' } })
+    y += LINE_HEIGHT + 14
+  }
+
   if (qrDims) {
     ops.push({ y, text: 'สแกนเพื่อชำระเงิน', opts: { size: 18, align: 'center' } })
     y += LINE_HEIGHT
