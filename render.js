@@ -77,8 +77,8 @@ const QR_MARGIN_TOP = 16
 const qr = loadImageAsset(QR_PATH)
 const qrReady = qr.ready
 
-function drawLine(ctx, y, text, opts = {}) {
-  const { size = 22, bold = false, align = 'left' } = opts
+function drawLine(ctx, y, text, opts = {}, textSize = 22) {
+  const { size = textSize, bold = false, align = 'left' } = opts
   ctx.font = `${bold ? 'bold ' : ''}${size}px ${FONT_FAMILY}`
   ctx.fillStyle = '#000'
   ctx.textAlign = align
@@ -228,7 +228,7 @@ function renderKotImage(data) {
 
   for (const op of ops) {
     if (op.divider) drawDivider(ctx, op.y)
-    else drawLine(ctx, op.y, op.text, op.opts)
+    else drawLine(ctx, op.y, op.text, op.opts, 35)
   }
 
   return canvas.toBuffer('image/png')
