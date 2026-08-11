@@ -144,6 +144,13 @@ function renderReceiptImage(data) {
     ops.push({ y, text: `฿${data.serviceCharge.toLocaleString()}`, opts: { align: 'right' } })
     y += LINE_HEIGHT
   }
+  // Snapshotted onto the Bill at print time (see printBill/closeBillAndTable
+  // in bill-actions.ts) — only present when a discount campaign was applied.
+  if (data.discountAmount > 0) {
+    ops.push({ y, text: `ส่วนลด ${data.discountName} ${data.discountPercent}%`, opts: { align: 'left' } })
+    ops.push({ y, text: `-฿${data.discountAmount.toLocaleString()}`, opts: { align: 'right' } })
+    y += LINE_HEIGHT
+  }
   ops.push({ y, text: 'รวมทั้งหมด', opts: { size: 24, bold: true, align: 'left' } })
   ops.push({ y, text: `฿${data.total.toLocaleString()}`, opts: { size: 24, bold: true, align: 'right' } })
   y += LINE_HEIGHT + 14
