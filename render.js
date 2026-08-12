@@ -30,6 +30,16 @@ const WIDTH = 576
 const LINE_HEIGHT = 30
 const MARGIN = 16
 
+const RECEIPT_LINE_HEIGHT = 46
+const RECEIPT_TEXT_SIZE = 36
+
+// Gap after a divider before the next text baseline — must clear that text's
+// ascent (roughly 0.7-0.8x its font size) or the divider line visually cuts
+// through it. Was a flat 25px tuned for the original 22px text; derived from
+// RECEIPT_TEXT_SIZE now so bumping the size again (as happened once already)
+// can't reintroduce the same overlap.
+const RECEIPT_DIVIDER_GAP = Math.round(RECEIPT_TEXT_SIZE * 1.14)
+
 // Loads a PNG/JPG that may not exist (logo, payment QR — both optional).
 // img.complete reports true the instant src is set, but drawImage silently
 // paints nothing until decode() actually resolves — so callers must await
@@ -95,105 +105,163 @@ function drawDivider(ctx, y) {
   ctx.stroke()
 }
 
+// Hard cap on any single receipt image's height, in dots. Not a spec limit —
+// ESC/POS's GS v 0 raster command technically allows up to 65535 — it's a
+// REAL, observed hardware/firmware limit: a 3256px (~407mm) receipt got the
+// printer's raster parser to desync entirely and print garbled characters
+// instead of the image (confirmed on the actual printer — see
+// scripts/test-long-receipt.js). 1876px printed correctly. This sits with
+// real margin below the proven-working point, since the exact hardware limit
+// isn't pinned down closer than "somewhere between 1876 and 3256" and a
+// failed physical receipt is worse than one extra paper cut.
+const MAX_PAGE_HEIGHT = 1600
+
+// A same-size budget reserved for the totals/QR/thank-you block so it's never
+// split mid-block across a page boundary — approximate on purpose (a page
+// landing a bit under MAX_PAGE_HEIGHT is harmless; the real hard limit only
+// matters as a ceiling, not a target to fill exactly).
+function footerBudget(data, qrDims) {
+  let n = 3 // divider gap + subtotal + "total" line pair
+  if (data.serviceCharge > 0) n += 1
+  if (data.discountAmount > 0) n += 2
+  if (data.received != null) n += 3
+  let px = n * RECEIPT_LINE_HEIGHT + 60
+  if (qrDims) px += qrDims.height + QR_MARGIN_TOP + RECEIPT_LINE_HEIGHT
+  return px
+}
+
 function renderReceiptImage(data) {
   // Same dry-layout-then-draw approach as renderKotImage — height always
   // matches drawn content exactly, no magic line-count formula to keep in
-  // sync as lines are added/removed here.
-  const ops = []
+  // sync as lines are added/removed here. Extended to paginate: whenever the
+  // next line (or the whole footer block) wouldn't fit under
+  // MAX_PAGE_HEIGHT, the current page is finalized and drawn, and a new page
+  // starts with a lightweight "(continued)" header — the printer cuts
+  // between each (see printer.js's printReceiptImage), so a bill too long
+  // for one slip comes out as several instead of failing outright.
   const logoDims = scaledDims(logo.image, LOGO_MAX_WIDTH)
   const qrDims = scaledDims(qr.image, QR_MAX_WIDTH)
-  let y = 20
+  const pages = []
 
-  if (logoDims) {
-    ops.push({ image: logo.image, x: (WIDTH - logoDims.width) / 2, y, width: logoDims.width, height: logoDims.height })
-    y += logoDims.height + LOGO_MARGIN_BOTTOM
+  let ops = []
+  let y = 0
+
+  function startPage(isFirstPage) {
+    ops = []
+    y = 20
+
+    if (isFirstPage && logoDims) {
+      ops.push({ image: logo.image, x: (WIDTH - logoDims.width) / 2, y, width: logoDims.width, height: logoDims.height })
+      y += logoDims.height + LOGO_MARGIN_BOTTOM
+    }
+
+    // The logo already carries the restaurant name/branding as an image, so
+    // a plain-text name line is only drawn if the caller explicitly passes
+    // one (e.g. a future settings-driven name) — skipped by default, which
+    // also sidesteps needing that string to be in a script this font covers.
+    if (isFirstPage && data.restaurantName) {
+      ops.push({ y, text: data.restaurantName, opts: { size: RECEIPT_TEXT_SIZE, bold: true, align: 'center' } })
+      y += RECEIPT_LINE_HEIGHT + 6
+    }
+
+    // Table number is the thing staff actually scan for when matching a
+    // printed receipt to a bill, so it's the largest, boldest line on the page.
+    const label = isFirstPage ? `โต๊ะ ${data.tableNumber}` : `โต๊ะ ${data.tableNumber} (ต่อ)`
+    ops.push({ y, text: label, opts: { size: 34, bold: true, align: 'center' } })
+    y += RECEIPT_LINE_HEIGHT + 6
+
+    if (isFirstPage) {
+      ops.push({ y, text: new Date().toLocaleString('lo-LA'), opts: { size: 18, align: 'center' } })
+      y += RECEIPT_LINE_HEIGHT
+    }
+
+    ops.push({ divider: true, y })
+    y += RECEIPT_DIVIDER_GAP
   }
 
-  // The logo already carries the restaurant name/branding as an image, so a
-  // plain-text name line is only drawn if the caller explicitly passes one
-  // (e.g. a future settings-driven name) — skipped by default, which also
-  // sidesteps needing that string to be in a script this font covers.
-  if (data.restaurantName) {
-    ops.push({ y, text: data.restaurantName, opts: { size: 22, bold: true, align: 'center' } })
-    y += LINE_HEIGHT + 6
+  function finishPage() {
+    const height = y + 20
+    const canvas = createCanvas(WIDTH, height)
+    const ctx = canvas.getContext('2d')
+    ctx.fillStyle = '#fff'
+    ctx.fillRect(0, 0, WIDTH, height)
+    for (const op of ops) {
+      if (op.image) ctx.drawImage(op.image, op.x, op.y, op.width, op.height)
+      else if (op.divider) drawDivider(ctx, op.y)
+      else drawLine(ctx, op.y, op.text, op.opts, RECEIPT_TEXT_SIZE)
+    }
+    pages.push(canvas.toBuffer('image/png'))
   }
 
-  // Table number is the thing staff actually scan for when matching a
-  // printed receipt to a bill, so it's the largest, boldest line on the page.
-  ops.push({ y, text: `โต๊ะ ${data.tableNumber}`, opts: { size: 30, bold: true, align: 'center' } })
-  y += LINE_HEIGHT + 6
-  ops.push({ y, text: new Date().toLocaleString('lo-LA'), opts: { size: 16, align: 'center' } })
-  y += LINE_HEIGHT
-
-  ops.push({ divider: true, y })
-  y += 25
+  startPage(true)
 
   for (const line of data.lines) {
+    if (y + RECEIPT_LINE_HEIGHT > MAX_PAGE_HEIGHT) {
+      finishPage()
+      startPage(false)
+    }
     ops.push({ y, text: `${line.quantity}x ${line.name}`, opts: { align: 'left' } })
     ops.push({ y, text: line.lineTotal.toLocaleString(), opts: { align: 'right' } })
-    y += LINE_HEIGHT
+    y += RECEIPT_LINE_HEIGHT
+  }
+
+  // Give the totals/QR/thank-you block its own fresh page if it wouldn't
+  // fully fit on whatever page the last item line landed on.
+  if (y + footerBudget(data, qrDims) > MAX_PAGE_HEIGHT) {
+    finishPage()
+    startPage(false)
   }
 
   ops.push({ divider: true, y })
-  y += 25
+  y += RECEIPT_DIVIDER_GAP
   ops.push({ y, text: 'รวมย่อย', opts: { align: 'left' } })
   ops.push({ y, text: `฿${data.subtotal.toLocaleString()}`, opts: { align: 'right' } })
-  y += LINE_HEIGHT
+  y += RECEIPT_LINE_HEIGHT
   if (data.serviceCharge > 0) {
     ops.push({ y, text: 'ค่าบริการ', opts: { align: 'left' } })
     ops.push({ y, text: `฿${data.serviceCharge.toLocaleString()}`, opts: { align: 'right' } })
-    y += LINE_HEIGHT
+    y += RECEIPT_LINE_HEIGHT
   }
   // Snapshotted onto the Bill at print time (see printBill/closeBillAndTable
   // in bill-actions.ts) — only present when a discount campaign was applied.
   if (data.discountAmount > 0) {
     ops.push({ y, text: `ส่วนลด ${data.discountName} ${data.discountPercent}%`, opts: { align: 'left' } })
     ops.push({ y, text: `-฿${data.discountAmount.toLocaleString()}`, opts: { align: 'right' } })
-    y += LINE_HEIGHT - 8
-    ops.push({ y, text: 'ไม่รวมเครื่องดื่ม', opts: { size: 14, align: 'left' } })
-    y += LINE_HEIGHT - 6
+    y += RECEIPT_LINE_HEIGHT - 8
+    ops.push({ y, text: 'ไม่รวมเครื่องดื่ม', opts: { size: 16, align: 'left' } })
+    y += RECEIPT_LINE_HEIGHT - 6
   }
-  ops.push({ y, text: 'รวมทั้งหมด', opts: { size: 24, bold: true, align: 'left' } })
-  ops.push({ y, text: `฿${data.total.toLocaleString()}`, opts: { size: 24, bold: true, align: 'right' } })
-  y += LINE_HEIGHT + 14
+  ops.push({ y, text: 'รวมทั้งหมด', opts: { size: 28, bold: true, align: 'left' } })
+  ops.push({ y, text: `฿${data.total.toLocaleString()}`, opts: { size: 28, bold: true, align: 'right' } })
+  y += RECEIPT_LINE_HEIGHT + 14
 
   // Only present on the reprint fired after payment is confirmed (see
   // closeBillAndTable/enqueueReceipt) — the pre-payment "① Print bill" job
   // never sets these, so this block is skipped there.
   if (data.received != null) {
     ops.push({ divider: true, y })
-    y += 25
+    y += RECEIPT_DIVIDER_GAP
     ops.push({ y, text: 'รับเงิน', opts: { align: 'left' } })
     ops.push({ y, text: `฿${data.received.toLocaleString()}`, opts: { align: 'right' } })
-    y += LINE_HEIGHT
+    y += RECEIPT_LINE_HEIGHT
     ops.push({ y, text: 'เงินทอน', opts: { align: 'left' } })
     ops.push({ y, text: `฿${data.change.toLocaleString()}`, opts: { align: 'right' } })
-    y += LINE_HEIGHT + 14
+    y += RECEIPT_LINE_HEIGHT + 14
   }
 
   if (qrDims) {
-    ops.push({ y, text: 'สแกนเพื่อชำระเงิน', opts: { size: 18, align: 'center' } })
-    y += LINE_HEIGHT
+    ops.push({ y, text: 'สแกนเพื่อชำระเงิน', opts: { size: 20, align: 'center' } })
+    y += RECEIPT_LINE_HEIGHT
     ops.push({ image: qr.image, x: (WIDTH - qrDims.width) / 2, y, width: qrDims.width, height: qrDims.height })
     y += qrDims.height + QR_MARGIN_TOP
   }
 
-  ops.push({ y, text: 'ขอบคุณที่ใช้บริการ', opts: { size: 18, align: 'center' } })
+  ops.push({ y, text: 'ขอบคุณที่ใช้บริการ', opts: { size: 20, align: 'center' } })
   y += 8
 
-  const height = y + 20
-  const canvas = createCanvas(WIDTH, height)
-  const ctx = canvas.getContext('2d')
-  ctx.fillStyle = '#fff'
-  ctx.fillRect(0, 0, WIDTH, height)
+  finishPage()
 
-  for (const op of ops) {
-    if (op.image) ctx.drawImage(op.image, op.x, op.y, op.width, op.height)
-    else if (op.divider) drawDivider(ctx, op.y)
-    else drawLine(ctx, op.y, op.text, op.opts)
-  }
-
-  return canvas.toBuffer('image/png')
+  return pages
 }
 
 function renderKotImage(data) {

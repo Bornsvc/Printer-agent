@@ -35,14 +35,17 @@ async function main() {
   await Promise.all([ready, logoReady, qrReady])
 
   console.log('🖼  Rendering receipt image...')
-  const image = renderReceiptImage(sample)
+  const pages = renderReceiptImage(sample) // array of page buffers (usually just 1)
 
-  const previewPath = path.join(__dirname, 'last-receipt-preview.png')
-  fs.writeFileSync(previewPath, image)
-  console.log(`💾 Saved preview: ${previewPath}`)
+  pages.forEach((page, i) => {
+    const suffix = pages.length > 1 ? `-${i + 1}` : ''
+    const previewPath = path.join(__dirname, `last-receipt-preview${suffix}.png`)
+    fs.writeFileSync(previewPath, page)
+    console.log(`💾 Saved preview: ${previewPath}`)
+  })
 
-  console.log('🖨️  Sending to RECEIPT printer...')
-  await printReceiptImage(image)
+  console.log(`🖨️  Sending to RECEIPT printer (${pages.length} page${pages.length > 1 ? 's' : ''})...`)
+  await printReceiptImage(pages)
   console.log('✅ Done — check the printer.')
 }
 

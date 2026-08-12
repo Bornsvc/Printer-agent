@@ -133,8 +133,16 @@ async function printImageBufferToStation(station, imageBuffer) {
   }
 }
 
-async function printReceiptImage(imageBuffer) {
-  await printImageBufferToStation('RECEIPT', imageBuffer)
+// renderReceiptImage returns an array of page buffers (usually just one) —
+// each gets printed and cut in sequence, on the same connection-per-call
+// pattern printImageBufferToStation already uses, so a bill too long for one
+// slip comes out as several instead of failing/garbling (see render.js's
+// MAX_PAGE_HEIGHT). Also accepts a bare single buffer for any older caller.
+async function printReceiptImage(pages) {
+  const list = Array.isArray(pages) ? pages : [pages]
+  for (const page of list) {
+    await printImageBufferToStation('RECEIPT', page)
+  }
 }
 
 async function printKotImage(station, imageBuffer) {
