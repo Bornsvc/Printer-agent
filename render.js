@@ -205,27 +205,31 @@ function renderKotImage(data) {
   // draw pass never recomputes a position, only replays what the dry pass logged.
   const ops = []
   let y = 36
+  // Kitchen slips are read at a glance from across the pass, so KOT text runs
+  // noticeably larger than receipt text — with a taller line height to match,
+  // otherwise the bigger glyphs overlap the next line.
+  const KOT_LINE_HEIGHT = 44
 
-  ops.push({ y, text: `โต๊ะ ${data.tableNumber}`, opts: { size: 28, bold: true, align: 'center' } })
-  y += LINE_HEIGHT + 4
+  ops.push({ y, text: `โต๊ะ ${data.tableNumber}`, opts: { size: 38, bold: true, align: 'center' } })
+  y += KOT_LINE_HEIGHT + 4
 
   if (data.station) {
-    ops.push({ y, text: data.station, opts: { size: 20, align: 'center' } })
-    y += LINE_HEIGHT
+    ops.push({ y, text: data.station, opts: { size: 26, align: 'center' } })
+    y += KOT_LINE_HEIGHT
   }
 
-  ops.push({ y, text: new Date().toLocaleString('lo-LA'), opts: { size: 16, align: 'center' } })
-  y += LINE_HEIGHT
+  ops.push({ y, text: new Date().toLocaleString('lo-LA'), opts: { size: 18, align: 'center' } })
+  y += KOT_LINE_HEIGHT
 
   ops.push({ divider: true, y })
   y += 25
 
   for (const item of data.items) {
-    ops.push({ y, text: `${item.quantity}x ${item.name}`, opts: { size: 24, bold: true } })
-    y += LINE_HEIGHT
+    ops.push({ y, text: `${item.quantity}x ${item.name}`, opts: { size: 34, bold: true } })
+    y += KOT_LINE_HEIGHT
     if (item.note) {
-      ops.push({ y, text: `  * ${item.note}`, opts: { size: 18 } })
-      y += LINE_HEIGHT
+      ops.push({ y, text: `  * ${item.note}`, opts: { size: 24 } })
+      y += KOT_LINE_HEIGHT - 6
     }
   }
 
