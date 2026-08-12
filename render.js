@@ -237,7 +237,7 @@ function renderKotImage(data) {
 
   for (const op of ops) {
     if (op.divider) drawDivider(ctx, op.y)
-    else drawLine(ctx, op.y, op.text, op.opts, 50)
+    else drawLine(ctx, op.y, op.text, op.opts, 70)
   }
 
   return canvas.toBuffer('image/png')
