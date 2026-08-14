@@ -128,9 +128,19 @@ async function printImageBufferToStation(station, imageBuffer) {
     // Audible cue that a job actually finished, since staff aren't always
     // standing right at the printer to see paper come out. Queued into the
     // same command buffer as printImage/cut above — one execute() flushes
-    // all three together. No-op on hardware with no buzzer (the printer
-    // just ignores the ESC/POS beep command), so safe to always send.
-    printer.beep()
+    // all three together.
+    //
+    // RECEIPT-only on purpose: scripts/test-beep.js has only ever confirmed
+    // this ESC/POS command against the RECEIPT printer. On an unverified
+    // model (the kitchen stations, still various clone units) a rejected or
+    // misinterpreted buzzer command can stall the printer's command
+    // processor mid-buffer and drop the job — invisibly, since execute()
+    // still resolves once the bytes are handed to the OS socket either way
+    // (see index.js's PRINT_GAP_MS comment). Enable per-station once that
+    // station's printer has been beep-tested the same way.
+    if (station === 'RECEIPT') {
+      printer.beep()
+    }
     await printer.execute()
   } catch (err) {
     throw new Error(`Print failed for ${station} (${describeTarget(target)}): ${err.message}`)

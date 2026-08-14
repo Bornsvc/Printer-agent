@@ -8,7 +8,7 @@ const AGENT_SECRET = process.env.AGENT_SECRET
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS) || 3000
 const PRINT_RETRY_DELAY_MS = Number(process.env.PRINT_RETRY_DELAY_MS) || 3000
 const DRAWER_RETRIES = Number(process.env.DRAWER_RETRIES) || 1
-const PRINT_GAP_MS = Number(process.env.PRINT_GAP_MS) || 2000
+const PRINT_GAP_MS = Number(process.env.PRINT_GAP_MS) || 3000
 const PRINT_RETRY_ATTEMPTS = Number(process.env.PRINT_RETRY_ATTEMPTS) || 3
 const PRINT_RETRY_WINDOW_MS = Number(process.env.PRINT_RETRY_WINDOW_MS) || 6 * 60 * 1000
 

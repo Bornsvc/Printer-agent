@@ -292,8 +292,13 @@ function renderKotImage(data) {
   ops.push({ y, text: `โต๊ะ ${data.tableNumber}`, opts: { size: 38, bold: true, align: 'center' } })
   y += KOT_LINE_HEIGHT + 4
 
-  if (data.station) {
-    ops.push({ y, text: data.station, opts: { size: 26, align: 'center' } })
+  // stationLabel is the Lao display text (see lib/actions/print-jobs.ts's
+  // enqueueOrderKot); `station` is only the routing key (e.g. "HOT_KITCHEN")
+  // and falls back here only for scripts/test-kot.js's manual sample data,
+  // which sets station but no stationLabel.
+  const stationHeader = data.stationLabel || data.station
+  if (stationHeader) {
+    ops.push({ y, text: stationHeader, opts: { size: 26, align: 'center' } })
     y += KOT_LINE_HEIGHT
   }
 
