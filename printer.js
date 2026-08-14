@@ -125,6 +125,12 @@ async function printImageBufferToStation(station, imageBuffer) {
     const printer = createPrinterForTarget(target)
     await printer.printImage(tmpPath)
     printer.cut()
+    // Audible cue that a job actually finished, since staff aren't always
+    // standing right at the printer to see paper come out. Queued into the
+    // same command buffer as printImage/cut above — one execute() flushes
+    // all three together. No-op on hardware with no buzzer (the printer
+    // just ignores the ESC/POS beep command), so safe to always send.
+    printer.beep()
     await printer.execute()
   } catch (err) {
     throw new Error(`Print failed for ${station} (${describeTarget(target)}): ${err.message}`)
@@ -166,4 +172,23 @@ async function openCashDrawer() {
   }
 }
 
-module.exports = { printReceiptImage, printKotImage, openCashDrawer, ready }
+// Isolated buzzer test (see scripts/test-beep.js) — same ESC/POS command
+// printImageBufferToStation already sends on every real print, but on its
+// own with no image/cut, so you can confirm the printer's buzzer works
+// without spending paper on a full test print each time.
+async function testBeep() {
+  const target = printerCache['RECEIPT']
+  if (!target) {
+    throw new Error(`ບໍ່ໄດ້ຕັ້ງຄ່າ IP ໃຫ້ RECEIPT — ໄປຕັ້ງໃນ /admin/printers`)
+  }
+
+  try {
+    const printer = createPrinterForTarget(target)
+    printer.beep()
+    await printer.execute()
+  } catch (err) {
+    throw new Error(`Beep failed for RECEIPT (${describeTarget(target)}): ${err.message}`)
+  }
+}
+
+module.exports = { printReceiptImage, printKotImage, openCashDrawer, testBeep, ready }

@@ -123,6 +123,7 @@ const MAX_PAGE_HEIGHT = 1600
 function footerBudget(data, qrDims) {
   let n = 3 // divider gap + subtotal + "total" line pair
   if (data.serviceCharge > 0) n += 1
+  if (data.isVip) n += 1
   if (data.discountAmount > 0) n += 2
   if (data.received != null) n += 3
   let px = n * RECEIPT_LINE_HEIGHT + 60
@@ -220,6 +221,16 @@ function renderReceiptImage(data) {
   if (data.serviceCharge > 0) {
     ops.push({ y, text: 'ค่าบริการ', opts: { align: 'left' } })
     ops.push({ y, text: `฿${data.serviceCharge.toLocaleString()}`, opts: { align: 'right' } })
+    y += RECEIPT_LINE_HEIGHT
+  }
+  // VIP table hourly surcharge — shown whenever the table is VIP, even at ฿0
+  // (the spend threshold waived it), so that's visible rather than silently
+  // absent. vipDurationLabel arrives pre-formatted (e.g. "2h 20m") from the
+  // main app's lib/vip-charge.ts — no duration math done here.
+  if (data.isVip) {
+    const label = data.vipChargeAmount > 0 ? `VIP Table (${data.vipDurationLabel})` : 'VIP Table Charge'
+    ops.push({ y, text: label, opts: { align: 'left' } })
+    ops.push({ y, text: `฿${data.vipChargeAmount.toLocaleString()}`, opts: { align: 'right' } })
     y += RECEIPT_LINE_HEIGHT
   }
   // Snapshotted onto the Bill at print time (see printBill/closeBillAndTable
