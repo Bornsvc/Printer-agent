@@ -31,7 +31,7 @@ const LINE_HEIGHT = 30
 const MARGIN = 16
 
 const RECEIPT_LINE_HEIGHT = 46
-const RECEIPT_TEXT_SIZE = 22
+const RECEIPT_TEXT_SIZE = 36
 
 // Gap after a divider before the next text baseline — must clear that text's
 // ascent (roughly 0.7-0.8x its font size) or the divider line visually cuts
@@ -105,310 +105,160 @@ function drawDivider(ctx, y) {
   ctx.stroke()
 }
 
-// Hard cap on any single receipt image's height, in dots. Not a spec limit —
+// Soft target height, in dots, for a single receipt image. Not a spec limit —
 // ESC/POS's GS v 0 raster command technically allows up to 65535 — it's a
 // REAL, observed hardware/firmware limit: a 3256px (~407mm) receipt got the
 // printer's raster parser to desync entirely and print garbled characters
 // instead of the image (confirmed on the actual printer — see
-// scripts/test-long-receipt.js). 1876px printed correctly. This sits with
-// real margin below the proven-working point, since the exact hardware limit
-// isn't pinned down closer than "somewhere between 1876 and 3256" and a
-// failed physical receipt is worse than one extra paper cut.
+// scripts/test-long-receipt.js). 1876px printed correctly. Receipts are
+// always a single slip (staff want one bill, never a "(continued)" cut), so
+// whenever the content would land above this, the whole layout is scaled
+// down — see MIN_RECEIPT_SCALE — instead of splitting into multiple pages.
+// A bill so long it still doesn't fit even at the minimum readable scale
+// prints taller than this target rather than ever being cut into two.
 const MAX_PAGE_HEIGHT = 1600
 
-// A same-size budget reserved for the totals/QR/thank-you block so it's never
-// split mid-block across a page boundary — approximate on purpose (a page
-// landing a bit under MAX_PAGE_HEIGHT is harmless; the real hard limit only
-// matters as a ceiling, not a target to fill exactly).
-function footerBudget(data, qrDims) {
-  let n = 3 // divider gap + subtotal + "total" line pair
-  if (data.serviceCharge > 0) n += 1
-  if (data.isVip) n += 1
-  if (data.discountAmount > 0) n += 2
-  if (data.received != null) n += 3
-  let px = n * RECEIPT_LINE_HEIGHT + 60
-  if (qrDims) px += qrDims.height + QR_MARGIN_TOP + RECEIPT_LINE_HEIGHT
-  return px
+// Floor on how far a long bill gets shrunk before we give up shrinking and
+// just let the page grow past MAX_PAGE_HEIGHT — 36 * 0.6 = ~22px, the size
+// this receipt text used to run at full-time (see "up text size" in git
+// history) before it was bumped to 36, so it's a known-readable minimum
+// rather than an untested guess.
+const MIN_RECEIPT_SCALE = 0.6
+
+// Lays out a full receipt at a given scale and returns the draw ops plus the
+// resulting height, without touching a canvas. renderReceiptImage calls this
+// once at scale 1 to measure the natural height, then (if that's over
+// MAX_PAGE_HEIGHT) again at a smaller scale. Shrinking the font size alone
+// would NOT shrink the total height — each line's vertical position is
+// driven by the line-height increment, not the glyph size — so every
+// vertical measurement here (line height, gaps, margins) scales together.
+function layoutReceipt(data, logoDims, qrDims, scale) {
+  const sz = (px) => Math.round(px * scale)
+  const lineHeight = sz(RECEIPT_LINE_HEIGHT)
+  const textSize = sz(RECEIPT_TEXT_SIZE)
+  const dividerGap = Math.round(textSize * 1.14)
+
+  const ops = []
+  let y = sz(20)
+
+  // Header
+  if (logoDims) {
+    ops.push({ image: logo.image, x: (WIDTH - logoDims.width) / 2, y, width: logoDims.width, height: logoDims.height })
+    y += logoDims.height + sz(LOGO_MARGIN_BOTTOM)
+  }
+
+  if (data.restaurantName) {
+    ops.push({ y, text: data.restaurantName, opts: { size: textSize, bold: true, align: 'center' } })
+    y += lineHeight + sz(6)
+  }
+
+  ops.push({ y, text: `โต๊ะ ${data.tableNumber}`, opts: { size: sz(34), bold: true, align: 'center' } })
+  y += lineHeight + sz(6)
+
+  ops.push({ y, text: new Date().toLocaleString('lo-LA'), opts: { size: sz(18), align: 'center' } })
+  y += lineHeight
+
+  ops.push({ divider: true, y })
+  y += dividerGap
+
+  // Items
+  for (const line of data.lines) {
+    ops.push({ y, text: `${line.quantity}x ${line.name}`, opts: { size: textSize, align: 'left' } })
+    ops.push({ y, text: line.lineTotal.toLocaleString(), opts: { size: textSize, align: 'right' } })
+    y += lineHeight
+  }
+
+  // Totals
+  ops.push({ divider: true, y })
+  y += dividerGap
+  ops.push({ y, text: 'รวมย่อย', opts: { size: textSize, align: 'left' } })
+  ops.push({ y, text: `฿${data.subtotal.toLocaleString()}`, opts: { size: textSize, align: 'right' } })
+  y += lineHeight
+
+  if (data.serviceCharge > 0) {
+    ops.push({ y, text: 'ค่าบริการ', opts: { size: textSize, align: 'left' } })
+    ops.push({ y, text: `฿${data.serviceCharge.toLocaleString()}`, opts: { size: textSize, align: 'right' } })
+    y += lineHeight
+  }
+
+  // VIP table hourly surcharge — shown whenever the table is VIP, even at ฿0
+  // (the spend threshold waived it), so that's visible rather than silently
+  // absent. vipDurationLabel arrives pre-formatted (e.g. "2h 20m") from the
+  // main app's lib/vip-charge.ts — no duration math done here.
+  if (data.isVip) {
+    const label = data.vipChargeAmount > 0 ? `VIP Table (${data.vipDurationLabel})` : 'VIP Table Charge'
+    ops.push({ y, text: label, opts: { size: textSize, align: 'left' } })
+    ops.push({ y, text: `฿${data.vipChargeAmount.toLocaleString()}`, opts: { size: textSize, align: 'right' } })
+    y += lineHeight
+  }
+
+  // Snapshotted onto the Bill at print time (see printBill/closeBillAndTable
+  // in bill-actions.ts) — only present when a discount campaign was applied.
+  if (data.discountAmount > 0) {
+    ops.push({ y, text: `ส่วนลด ${data.discountName} ${data.discountPercent}%`, opts: { size: textSize, align: 'left' } })
+    ops.push({ y, text: `-฿${data.discountAmount.toLocaleString()}`, opts: { size: textSize, align: 'right' } })
+    y += lineHeight - sz(8)
+    ops.push({ y, text: 'ไม่รวมเครื่องดื่ม', opts: { size: sz(16), align: 'left' } })
+    y += lineHeight - sz(6)
+  }
+
+  // Total
+  ops.push({ y, text: 'รวมทั้งหมด', opts: { size: sz(28), bold: true, align: 'left' } })
+  ops.push({ y, text: `฿${data.total.toLocaleString()}`, opts: { size: sz(28), bold: true, align: 'right' } })
+  y += lineHeight + sz(14)
+
+  // Payment — only present on the reprint fired after payment is confirmed
+  // (see closeBillAndTable/enqueueReceipt) — the pre-payment "① Print bill"
+  // job never sets these, so this block is skipped there.
+  if (data.received != null) {
+    ops.push({ divider: true, y })
+    y += dividerGap
+    ops.push({ y, text: 'รับเงิน', opts: { size: textSize, align: 'left' } })
+    ops.push({ y, text: `฿${data.received.toLocaleString()}`, opts: { size: textSize, align: 'right' } })
+    y += lineHeight
+    ops.push({ y, text: 'เงินทอน', opts: { size: textSize, align: 'left' } })
+    ops.push({ y, text: `฿${data.change.toLocaleString()}`, opts: { size: textSize, align: 'right' } })
+    y += lineHeight + sz(14)
+  }
+
+  // QR
+  if (qrDims) {
+    ops.push({ y, text: 'สแกนเพื่อชำระเงิน', opts: { size: sz(20), align: 'center' } })
+    y += lineHeight
+    ops.push({ image: qr.image, x: (WIDTH - qrDims.width) / 2, y, width: qrDims.width, height: qrDims.height })
+    y += qrDims.height + sz(QR_MARGIN_TOP)
+  }
+
+  ops.push({ y, text: 'ขอบคุณที่ใช้บริการ', opts: { size: sz(20), align: 'center' } })
+  y += sz(8)
+
+  return { ops, height: y + sz(20) }
 }
 
 function renderReceiptImage(data) {
   const logoDims = scaledDims(logo.image, LOGO_MAX_WIDTH)
   const qrDims = scaledDims(qr.image, QR_MAX_WIDTH)
 
-  let ops = []
-  let y = 20
-
-  // Header
-  if (logoDims) {
-    ops.push({
-      image: logo.image,
-      x: (WIDTH - logoDims.width) / 2,
-      y,
-      width: logoDims.width,
-      height: logoDims.height
-    })
-    y += logoDims.height + LOGO_MARGIN_BOTTOM
+  let layout = layoutReceipt(data, logoDims, qrDims, 1)
+  if (layout.height > MAX_PAGE_HEIGHT) {
+    const scale = Math.max(MIN_RECEIPT_SCALE, MAX_PAGE_HEIGHT / layout.height)
+    layout = layoutReceipt(data, logoDims, qrDims, scale)
   }
 
-  if (data.restaurantName) {
-    ops.push({
-      y,
-      text: data.restaurantName,
-      opts: {
-        size: RECEIPT_TEXT_SIZE,
-        bold: true,
-        align: 'center'
-      }
-    })
-    y += RECEIPT_LINE_HEIGHT + 6
-  }
-
-  ops.push({
-    y,
-    text: `โต๊ะ ${data.tableNumber}`,
-    opts: {
-      size: 34,
-      bold: true,
-      align: 'center'
-    }
-  })
-  y += RECEIPT_LINE_HEIGHT + 6
-
-  ops.push({
-    y,
-    text: new Date().toLocaleString('lo-LA'),
-    opts: {
-      size: 18,
-      align: 'center'
-    }
-  })
-  y += RECEIPT_LINE_HEIGHT
-
-  ops.push({ divider: true, y })
-  y += RECEIPT_DIVIDER_GAP
-
-  // Items
-  for (const line of data.lines) {
-    ops.push({
-      y,
-      text: `${line.quantity}x ${line.name}`,
-      opts: { align: 'left' }
-    })
-
-    ops.push({
-      y,
-      text: line.lineTotal.toLocaleString(),
-      opts: { align: 'right' }
-    })
-
-    y += RECEIPT_LINE_HEIGHT
-  }
-
-  // Totals
-  ops.push({ divider: true, y })
-  y += RECEIPT_DIVIDER_GAP
-
-  ops.push({
-    y,
-    text: 'รวมย่อย',
-    opts: { align: 'left' }
-  })
-
-  ops.push({
-    y,
-    text: `฿${data.subtotal.toLocaleString()}`,
-    opts: { align: 'right' }
-  })
-
-  y += RECEIPT_LINE_HEIGHT
-
-  if (data.serviceCharge > 0) {
-    ops.push({
-      y,
-      text: 'ค่าบริการ',
-      opts: { align: 'left' }
-    })
-
-    ops.push({
-      y,
-      text: `฿${data.serviceCharge.toLocaleString()}`,
-      opts: { align: 'right' }
-    })
-
-    y += RECEIPT_LINE_HEIGHT
-  }
-
-  if (data.isVip) {
-    const label =
-      data.vipChargeAmount > 0
-        ? `VIP Table (${data.vipDurationLabel})`
-        : 'VIP Table Charge'
-
-    ops.push({
-      y,
-      text: label,
-      opts: { align: 'left' }
-    })
-
-    ops.push({
-      y,
-      text: `฿${data.vipChargeAmount.toLocaleString()}`,
-      opts: { align: 'right' }
-    })
-
-    y += RECEIPT_LINE_HEIGHT
-  }
-
-  if (data.discountAmount > 0) {
-    ops.push({
-      y,
-      text: `ส่วนลด ${data.discountName} ${data.discountPercent}%`,
-      opts: { align: 'left' }
-    })
-
-    ops.push({
-      y,
-      text: `-฿${data.discountAmount.toLocaleString()}`,
-      opts: { align: 'right' }
-    })
-
-    y += RECEIPT_LINE_HEIGHT - 8
-
-    ops.push({
-      y,
-      text: 'ไม่รวมเครื่องดื่ม',
-      opts: {
-        size: 16,
-        align: 'left'
-      }
-    })
-
-    y += RECEIPT_LINE_HEIGHT - 6
-  }
-
-  // Total
-  ops.push({
-    y,
-    text: 'รวมทั้งหมด',
-    opts: {
-      size: 28,
-      bold: true,
-      align: 'left'
-    }
-  })
-
-  ops.push({
-    y,
-    text: `฿${data.total.toLocaleString()}`,
-    opts: {
-      size: 28,
-      bold: true,
-      align: 'right'
-    }
-  })
-
-  y += RECEIPT_LINE_HEIGHT + 14
-
-  // Payment
-  if (data.received != null) {
-    ops.push({ divider: true, y })
-    y += RECEIPT_DIVIDER_GAP
-
-    ops.push({
-      y,
-      text: 'รับเงิน',
-      opts: { align: 'left' }
-    })
-
-    ops.push({
-      y,
-      text: `฿${data.received.toLocaleString()}`,
-      opts: { align: 'right' }
-    })
-
-    y += RECEIPT_LINE_HEIGHT
-
-    ops.push({
-      y,
-      text: 'เงินทอน',
-      opts: { align: 'left' }
-    })
-
-    ops.push({
-      y,
-      text: `฿${data.change.toLocaleString()}`,
-      opts: { align: 'right' }
-    })
-
-    y += RECEIPT_LINE_HEIGHT + 14
-  }
-
-  // QR
-  if (qrDims) {
-    ops.push({
-      y,
-      text: 'สแกนเพื่อชำระเงิน',
-      opts: {
-        size: 20,
-        align: 'center'
-      }
-    })
-
-    y += RECEIPT_LINE_HEIGHT
-
-    ops.push({
-      image: qr.image,
-      x: (WIDTH - qrDims.width) / 2,
-      y,
-      width: qrDims.width,
-      height: qrDims.height
-    })
-
-    y += qrDims.height + QR_MARGIN_TOP
-  }
-
-  ops.push({
-    y,
-    text: 'ขอบคุณที่ใช้บริการ',
-    opts: {
-      size: 20,
-      align: 'center'
-    }
-  })
-
-  y += 8
-
-  // Create ONE canvas using the actual required height
-  const height = y + 20
-
-  const canvas = createCanvas(WIDTH, height)
+  const canvas = createCanvas(WIDTH, layout.height)
   const ctx = canvas.getContext('2d')
-
   ctx.fillStyle = '#fff'
-  ctx.fillRect(0, 0, WIDTH, height)
+  ctx.fillRect(0, 0, WIDTH, layout.height)
 
-  for (const op of ops) {
-    if (op.image) {
-      ctx.drawImage(
-        op.image,
-        op.x,
-        op.y,
-        op.width,
-        op.height
-      )
-    } else if (op.divider) {
-      drawDivider(ctx, op.y)
-    } else {
-      drawLine(
-        ctx,
-        op.y,
-        op.text,
-        op.opts,
-        RECEIPT_TEXT_SIZE
-      )
-    }
+  for (const op of layout.ops) {
+    if (op.image) ctx.drawImage(op.image, op.x, op.y, op.width, op.height)
+    else if (op.divider) drawDivider(ctx, op.y)
+    else drawLine(ctx, op.y, op.text, op.opts)
   }
 
+  // Still returned as an array — printer.js's printReceiptImage loops over
+  // it, and scripts/test-*.js log pages.length — so callers don't need to
+  // change even though it's always exactly one page now.
   return [canvas.toBuffer('image/png')]
 }
 
