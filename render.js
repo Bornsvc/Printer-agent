@@ -31,7 +31,7 @@ const LINE_HEIGHT = 30
 const MARGIN = 16
 
 const RECEIPT_LINE_HEIGHT = 46
-const RECEIPT_TEXT_SIZE = 36
+const RECEIPT_TEXT_SIZE = 22
 
 // Gap after a divider before the next text baseline — must clear that text's
 // ascent (roughly 0.7-0.8x its font size) or the divider line visually cuts
