@@ -98,7 +98,8 @@ abandoned Realtime approach.
 ### `.env.example`
 Copy to `.env` and fill in:
 - `API_URL` — the web app's URL (no trailing slash).
-- `AGENT_SECRET` — must match `PRINT_AGENT_SECRET` in the web app's env, sent
+- `AGENT_SECRET` — this restaurant's agent key, must match its `Tenant.agentKey`
+  row in the web app's database (per-tenant now, not a shared env var), sent
   as the `x-agent-key` header on every request.
 - `POLL_INTERVAL_MS` — optional, defaults to `3000`.
 
