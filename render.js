@@ -150,6 +150,75 @@ function scaledDims(image, maxWidth, maxHeight) {
   return { width: image.width * scale, height: image.height * scale }
 }
 
+// Converts an image to pure black/white via Floyd-Steinberg error-diffusion
+// dithering, composited onto a white background first (so a transparent
+// background — e.g. from a background-removal tool — becomes "no ink", not
+// black). This exists because the physical printer's own image conversion
+// (node-thermal-printer's EPSON driver, in node_modules — not our code) does
+// a hard per-pixel luminance threshold with no dithering at all: every pixel
+// below 128 grayscale prints as ink, everything else prints as nothing.
+// A logo in light/pastel colors can have EVERY pixel above that threshold —
+// confirmed on a real uploaded logo (solid gold/orange text, grayscale
+// 167-182 throughout) — so it renders correctly in the PNG preview shown in
+// /admin/settings but prints as a completely blank patch of paper, not just
+// faded. Dithering spreads each pixel's rounding error to its neighbors, so
+// a mid-tone color comes out as a recognizable stippled pattern instead of
+// vanishing outright. Runs fresh per receipt render (at whatever the logo's
+// final on-paper size is) rather than once at sync time, since MAX_PAGE_HEIGHT's
+// shrink pass can change that size receipt to receipt — dithering a fixed
+// source size and later resizing it would just reintroduce the same soft
+// gray edges dithering exists to remove. Cheap enough either way: at most
+// LOGO_MAX_WIDTH x LOGO_MAX_HEIGHT (320x320) pixels.
+//
+// Deliberately not used for the QR code — a real QR is already black/white,
+// so there's no washing-out problem to fix, and this codebase already treats
+// "don't distort a QR's fine modules" as a hard rule (see scaledDims' own
+// comment above): dithering's error diffusion could bleed across module
+// edges exactly where downscaling has already softened them, which is a
+// risk worth avoiding for zero benefit on an image that doesn't need it.
+function ditherToBlackWhite(image, width, height) {
+  const w = Math.max(1, Math.round(width))
+  const h = Math.max(1, Math.round(height))
+  const canvas = createCanvas(w, h)
+  const ctx = canvas.getContext('2d')
+  ctx.fillStyle = '#fff'
+  ctx.fillRect(0, 0, w, h)
+  ctx.drawImage(image, 0, 0, w, h)
+
+  const imageData = ctx.getImageData(0, 0, w, h)
+  const data = imageData.data
+  const gray = new Float32Array(w * h)
+  for (let i = 0, p = 0; i < data.length; i += 4, p++) {
+    gray[p] = 0.2126 * data[i] + 0.7152 * data[i + 1] + 0.0722 * data[i + 2]
+  }
+
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const i = y * w + x
+      const old = gray[i]
+      const black = old < 128
+      const err = old - (black ? 0 : 255)
+
+      if (x + 1 < w) gray[i + 1] += (err * 7) / 16
+      if (y + 1 < h) {
+        if (x > 0) gray[i - 1 + w] += (err * 3) / 16
+        gray[i + w] += (err * 5) / 16
+        if (x + 1 < w) gray[i + 1 + w] += (err * 1) / 16
+      }
+
+      const out = black ? 0 : 255
+      const di = i * 4
+      data[di] = out
+      data[di + 1] = out
+      data[di + 2] = out
+      data[di + 3] = 255
+    }
+  }
+
+  ctx.putImageData(imageData, 0, 0)
+  return canvas
+}
+
 // Optional restaurant logo printed at the top of RECEIPT tickets (not KOTs —
 // kitchen slips stay logo-free to save paper/time). Set from /admin/settings
 // (see BillBrandingForm.tsx); receipts print without a logo until a tenant
@@ -237,7 +306,7 @@ function layoutReceipt(data, logoDims, qrDims, scale) {
   if (logoDims) {
     const w = sz(logoDims.width)
     const h = sz(logoDims.height)
-    ops.push({ image: logo.image, x: (WIDTH - w) / 2, y, width: w, height: h })
+    ops.push({ image: logo.image, x: (WIDTH - w) / 2, y, width: w, height: h, dither: true })
     y += h + sz(LOGO_MARGIN_BOTTOM)
   }
 
@@ -347,8 +416,10 @@ function renderReceiptImage(data) {
   ctx.fillRect(0, 0, WIDTH, layout.height)
 
   for (const op of layout.ops) {
-    if (op.image) ctx.drawImage(op.image, op.x, op.y, op.width, op.height)
-    else if (op.divider) drawDivider(ctx, op.y)
+    if (op.image) {
+      const source = op.dither ? ditherToBlackWhite(op.image, op.width, op.height) : op.image
+      ctx.drawImage(source, op.x, op.y, op.width, op.height)
+    } else if (op.divider) drawDivider(ctx, op.y)
     else drawLine(ctx, op.y, op.text, op.opts)
   }
 
