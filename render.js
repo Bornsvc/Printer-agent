@@ -41,27 +41,29 @@ const RECEIPT_TEXT_SIZE = 36
 // can't reintroduce the same overlap.
 const RECEIPT_DIVIDER_GAP = Math.round(RECEIPT_TEXT_SIZE * 1.14)
 
-// Runtime-refreshable image asset (logo, payment QR — both optional, both
-// per-tenant since the tenant-provisioning multi-restaurant update). A
-// tenant sets these from /admin/settings in the main app rather than
-// touching this machine's filesystem; printer.js polls /api/printer-config
-// every 60s and calls sync(url) here with whatever that tenant currently has
-// configured (or null). Falls back to the local assetPath convention below
-// when unset, so an install that's never used the web UI keeps working
-// exactly as before. Caches the last-synced remote image to disk (under
-// assets/cache/) so a network hiccup — or the agent restarting — doesn't
-// blank out receipts; sync() only re-fetches when the URL actually changed.
+// Runtime-refreshable image asset (logo, payment QR — both optional,
+// per-tenant). A tenant sets these from /admin/settings in the main app;
+// printer.js polls /api/printer-config every 60s and calls sync(url) here
+// with whatever that tenant currently has configured. Unset (null) means no
+// image at all — this agent serves whichever tenant its own agentKey
+// belongs to, so there's no sensible "generic fallback image" to show a
+// restaurant that hasn't set its own; layoutReceipt already skips the whole
+// logo/QR block when `.image` is null, so an unconfigured tenant's receipts
+// just print without one, same as before this feature existed. Caches the
+// last-synced remote image to disk (under assets/cache/) so a network
+// hiccup — or the agent restarting — doesn't blank out a tenant's real,
+// already-configured branding; sync() only re-fetches when the URL changed.
 //
 // img.complete reports true the instant src is set, but drawImage silently
 // paints nothing until decode() actually resolves — so callers must await
 // `ready` before the first receipt is rendered, or the image draws blank.
 const CACHE_DIR = path.join(__dirname, 'assets', 'cache')
 
-function createImageAsset(name, assetPath) {
+function createImageAsset(name) {
   const cacheBinPath = path.join(CACHE_DIR, `${name}.bin`)
   const cacheUrlPath = path.join(CACHE_DIR, `${name}.url`)
   const asset = { image: null }
-  let currentUrl = null // null = currently showing the local assetPath fallback (or nothing)
+  let currentUrl = null // null = no image configured (or the fetch for it never succeeded)
 
   async function decode(buf) {
     const img = new Image()
@@ -70,34 +72,19 @@ function createImageAsset(name, assetPath) {
     return img
   }
 
-  async function loadLocalFallback() {
-    if (!fs.existsSync(assetPath)) {
-      asset.image = null
-      return
-    }
-    try {
-      asset.image = await decode(fs.readFileSync(assetPath))
-    } catch (err) {
-      console.warn(`⚠️  Failed to load ${path.basename(assetPath)}:`, err.message)
-      asset.image = null
-    }
-  }
-
-  // Best-effort initial load: prefer a previously-cached remote image (so a
-  // restart doesn't blank branding while waiting on the next network sync),
-  // else the local fallback file. Never throws.
+  // Best-effort initial load from a previously-cached remote image, so a
+  // restart doesn't blank a tenant's real branding while waiting on the
+  // next network sync. No cache yet (or unreadable) just means no image
+  // until the first successful sync() — never throws.
   asset.ready = (async () => {
     const cachedUrl = fs.existsSync(cacheUrlPath) ? fs.readFileSync(cacheUrlPath, 'utf8').trim() : ''
-    if (cachedUrl && fs.existsSync(cacheBinPath)) {
-      try {
-        asset.image = await decode(fs.readFileSync(cacheBinPath))
-        currentUrl = cachedUrl
-        return
-      } catch (err) {
-        console.warn(`⚠️  Cached ${name} image unreadable, falling back:`, err.message)
-      }
+    if (!cachedUrl || !fs.existsSync(cacheBinPath)) return
+    try {
+      asset.image = await decode(fs.readFileSync(cacheBinPath))
+      currentUrl = cachedUrl
+    } catch (err) {
+      console.warn(`⚠️  Cached ${name} image unreadable:`, err.message)
     }
-    await loadLocalFallback()
   })()
 
   // Called by printer.js after each /api/printer-config poll. Returns
@@ -117,16 +104,15 @@ function createImageAsset(name, assetPath) {
     if (next === currentUrl) return false
 
     if (!next) {
+      asset.image = null
+      currentUrl = null
       try {
-        await loadLocalFallback()
-        currentUrl = null
         fs.mkdirSync(CACHE_DIR, { recursive: true })
         fs.writeFileSync(cacheUrlPath, '')
-        return true
       } catch (err) {
-        console.warn(`⚠️  Failed to revert ${name} to local fallback:`, err.message)
-        return false
+        console.warn(`⚠️  Failed to clear cached ${name} image:`, err.message)
       }
+      return true
     }
 
     try {
@@ -165,23 +151,21 @@ function scaledDims(image, maxWidth, maxHeight) {
 }
 
 // Optional restaurant logo printed at the top of RECEIPT tickets (not KOTs —
-// kitchen slips stay logo-free to save paper/time). Drop a PNG/JPG at
-// print-agent/assets/logo.png to enable it; receipts print without a logo
-// if the file is missing.
-const LOGO_PATH = path.join(__dirname, 'assets', 'logo.png')
+// kitchen slips stay logo-free to save paper/time). Set from /admin/settings
+// (see BillBrandingForm.tsx); receipts print without a logo until a tenant
+// uploads one.
 const LOGO_MAX_WIDTH = 320
 const LOGO_MAX_HEIGHT = 320
 const LOGO_MARGIN_BOTTOM = 14
-const logo = createImageAsset('logo', LOGO_PATH)
+const logo = createImageAsset('logo')
 const logoReady = logo.ready
 
-// Optional payment QR code printed near the total on RECEIPT tickets. Drop a
-// PNG/JPG at print-agent/assets/qr-payment.png to enable it.
-const QR_PATH = path.join(__dirname, 'assets', 'qr-payment.png')
+// Optional payment QR code printed near the total on RECEIPT tickets. Set
+// from /admin/settings, same as the logo above.
 const QR_MAX_WIDTH = 260
 const QR_MAX_HEIGHT = 260
 const QR_MARGIN_TOP = 16
-const qr = createImageAsset('qr', QR_PATH)
+const qr = createImageAsset('qr')
 const qrReady = qr.ready
 
 // Called by printer.js's refreshPrinterConfig() after each /api/printer-config

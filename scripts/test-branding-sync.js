@@ -3,12 +3,12 @@
 // just two real, publicly-reachable image URLs (e.g. ones just uploaded via
 // /admin/settings — see BillBrandingForm.tsx). Checks the full contract:
 // fetch+cache on first sync, skip-refetch when the URL hasn't changed,
-// revert to the local assets/logo.png / assets/qr-payment.png fallback when
-// unset, that the images actually get drawn into a rendered receipt, and
-// that a host which accepts the connection but never responds times out
-// instead of hanging the whole agent (see render.js's comment on why
-// asset.sync has a fetch timeout at all — this is the exact failure mode
-// that motivated it).
+// clearing to no image at all when reverted to unset (there's no generic
+// local-file fallback — each agent serves exactly one tenant), that the
+// images actually get drawn into a rendered receipt, and that a host which
+// accepts the connection but never responds times out instead of hanging
+// the whole agent (see render.js's comment on why asset.sync has a fetch
+// timeout at all — this is the exact failure mode that motivated it).
 //
 // Usage:
 //   node scripts/test-branding-sync.js <logoUrl> <paymentQrUrl>
@@ -108,12 +108,17 @@ async function main() {
   const qrBandEnd = img.height - 60
   check('qr band has ink (before the closing line)', hasInkInBand(img, qrBandStart, qrBandEnd))
 
-  console.log('--- revert to unset (null, null): should fall back to local assets/*.png ---')
+  console.log('--- revert to unset (null, null): should print with no logo/QR at all ---')
   const reverted = await syncBranding({ logoUrl: null, paymentQrUrl: null })
   check('logo changed on revert to null', reverted.logoChanged === true)
   check('qr changed on revert to null', reverted.qrChanged === true)
   const cachedUrlFile = path.join(__dirname, '..', 'assets', 'cache', 'logo.url')
   check('logo.url cache cleared after revert', fs.readFileSync(cachedUrlFile, 'utf8').trim() === '')
+
+  const withoutBranding = renderReceiptImage(sample)[0]
+  const imgNoBranding = decodePng(withoutBranding)
+  check('no ink in the logo band once unset (y 0-160)', !hasInkInBand(imgNoBranding, 0, 160))
+  check('receipt is shorter with branding off than with it on', imgNoBranding.height < img.height)
 
   console.log('--- re-sync with a deliberately unreachable URL (fails fast): should keep last good image ---')
   const failedSync = await syncBranding({ logoUrl: 'http://127.0.0.1:1/nope.png', paymentQrUrl })
