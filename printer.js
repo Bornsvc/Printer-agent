@@ -3,6 +3,7 @@ const fetch = require('node-fetch')
 const fs = require('fs')
 const os = require('os')
 const path = require('path')
+const { syncBranding } = require('./render')
 
 const API_URL = process.env.API_URL
 const AGENT_SECRET = process.env.AGENT_SECRET
@@ -18,10 +19,23 @@ const ready = new Promise((resolve) => {
   markReady = resolve
 })
 
+// Guards only against overlapping with the next tick — same shape as
+// index.js's pollInProgress. Matters more now than it used to: syncBranding
+// below fetches an admin-controlled URL (see render.js's comment on why that
+// fetch has a timeout), and without this guard a slow-but-not-yet-timed-out
+// sync could still overlap the next interval's own sync of a different URL.
+let refreshInProgress = false
+
 async function refreshPrinterConfig() {
+  if (refreshInProgress) return
+  refreshInProgress = true
   try {
+    // 10s timeout for the same reason render.js's branding fetch has one —
+    // this is API_URL, normally your own server, but a flaky network or a
+    // hung reverse proxy would otherwise wedge markReady() below forever.
     const res = await fetch(`${API_URL}/api/printer-config`, {
       headers: { 'x-agent-key': AGENT_SECRET },
+      timeout: 10_000,
     })
     if (!res.ok) throw new Error(`Fetch failed: ${res.status}`)
     const data = await res.json()
@@ -37,10 +51,16 @@ async function refreshPrinterConfig() {
     }
     printerCache = next
     console.log('🔄 Printer config refreshed:', Object.keys(printerCache).join(', '))
+
+    const branding = await syncBranding({ logoUrl: data.logoUrl, paymentQrUrl: data.paymentQrUrl })
+    if (branding.logoChanged || branding.qrChanged) {
+      console.log('🖼️  Branding synced:', branding)
+    }
   } catch (err) {
     console.error('⚠️  Could not refresh printer config (using last known values):', err.message)
   } finally {
     markReady()
+    refreshInProgress = false
   }
 }
 

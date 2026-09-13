@@ -1,6 +1,7 @@
 const { createCanvas, GlobalFonts, Image } = require('@napi-rs/canvas')
 const path = require('path')
 const fs = require('fs')
+const fetch = require('node-fetch')
 
 // ⚠️ REQUIRED: a Thai-capable font at print-agent/fonts/NotoSansThai-Regular.ttf
 // (full glyph set, not a script-only subset — subsetted downloads from Google
@@ -40,33 +41,127 @@ const RECEIPT_TEXT_SIZE = 36
 // can't reintroduce the same overlap.
 const RECEIPT_DIVIDER_GAP = Math.round(RECEIPT_TEXT_SIZE * 1.14)
 
-// Loads a PNG/JPG that may not exist (logo, payment QR — both optional).
+// Runtime-refreshable image asset (logo, payment QR — both optional, both
+// per-tenant since the tenant-provisioning multi-restaurant update). A
+// tenant sets these from /admin/settings in the main app rather than
+// touching this machine's filesystem; printer.js polls /api/printer-config
+// every 60s and calls sync(url) here with whatever that tenant currently has
+// configured (or null). Falls back to the local assetPath convention below
+// when unset, so an install that's never used the web UI keeps working
+// exactly as before. Caches the last-synced remote image to disk (under
+// assets/cache/) so a network hiccup — or the agent restarting — doesn't
+// blank out receipts; sync() only re-fetches when the URL actually changed.
+//
 // img.complete reports true the instant src is set, but drawImage silently
 // paints nothing until decode() actually resolves — so callers must await
 // `ready` before the first receipt is rendered, or the image draws blank.
-function loadImageAsset(assetPath) {
+const CACHE_DIR = path.join(__dirname, 'assets', 'cache')
+
+function createImageAsset(name, assetPath) {
+  const cacheBinPath = path.join(CACHE_DIR, `${name}.bin`)
+  const cacheUrlPath = path.join(CACHE_DIR, `${name}.url`)
   const asset = { image: null }
-  asset.ready = (async () => {
-    if (!fs.existsSync(assetPath)) return
+  let currentUrl = null // null = currently showing the local assetPath fallback (or nothing)
+
+  async function decode(buf) {
+    const img = new Image()
+    img.src = buf
+    await img.decode()
+    return img
+  }
+
+  async function loadLocalFallback() {
+    if (!fs.existsSync(assetPath)) {
+      asset.image = null
+      return
+    }
     try {
-      const img = new Image()
-      img.src = fs.readFileSync(assetPath)
-      await img.decode()
-      asset.image = img
+      asset.image = await decode(fs.readFileSync(assetPath))
     } catch (err) {
       console.warn(`⚠️  Failed to load ${path.basename(assetPath)}:`, err.message)
+      asset.image = null
     }
+  }
+
+  // Best-effort initial load: prefer a previously-cached remote image (so a
+  // restart doesn't blank branding while waiting on the next network sync),
+  // else the local fallback file. Never throws.
+  asset.ready = (async () => {
+    const cachedUrl = fs.existsSync(cacheUrlPath) ? fs.readFileSync(cacheUrlPath, 'utf8').trim() : ''
+    if (cachedUrl && fs.existsSync(cacheBinPath)) {
+      try {
+        asset.image = await decode(fs.readFileSync(cacheBinPath))
+        currentUrl = cachedUrl
+        return
+      } catch (err) {
+        console.warn(`⚠️  Cached ${name} image unreadable, falling back:`, err.message)
+      }
+    }
+    await loadLocalFallback()
   })()
+
+  // Called by printer.js after each /api/printer-config poll. Returns
+  // whether the displayed image actually changed; never throws — a failed
+  // fetch just keeps showing the last known-good image. A tenant admin
+  // controls this URL (see BillBrandingForm's paste-URL field) and it's
+  // fetched from this machine's network on every poll, so both a timeout and
+  // a size cap are required, not just good practice — node-fetch v2 has no
+  // default timeout, and a host that accepts the connection but never
+  // responds (a captive portal, a stalled proxy) would otherwise hang this
+  // promise forever. That's fatal here: printer.js awaits this inside the
+  // same try/finally that calls markReady(), which index.js awaits before
+  // ever starting to poll for print jobs — so a single stuck fetch would
+  // silently stop the whole agent from printing anything, not just branding.
+  asset.sync = async (url) => {
+    const next = url || null
+    if (next === currentUrl) return false
+
+    if (!next) {
+      try {
+        await loadLocalFallback()
+        currentUrl = null
+        fs.mkdirSync(CACHE_DIR, { recursive: true })
+        fs.writeFileSync(cacheUrlPath, '')
+        return true
+      } catch (err) {
+        console.warn(`⚠️  Failed to revert ${name} to local fallback:`, err.message)
+        return false
+      }
+    }
+
+    try {
+      const res = await fetch(next, { timeout: 10_000, size: 10 * 1024 * 1024 })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const buf = await res.buffer()
+      const img = await decode(buf)
+      fs.mkdirSync(CACHE_DIR, { recursive: true })
+      fs.writeFileSync(cacheBinPath, buf)
+      fs.writeFileSync(cacheUrlPath, next)
+      asset.image = img
+      currentUrl = next
+      return true
+    } catch (err) {
+      console.warn(`⚠️  Failed to sync ${name} image from ${next} (keeping last known image):`, err.message)
+      return false
+    }
+  }
+
   return asset
 }
 
-// Scales an image down to maxWidth (never up), preserving aspect ratio —
-// stretching a QR code even slightly can make it fail to scan.
-function scaledDims(image, maxWidth) {
+// Scales an image down to fit within maxWidth x maxHeight (never up),
+// preserving aspect ratio — stretching a QR code even slightly can make it
+// fail to scan. Clamping height as well as width matters now that these can
+// be admin-uploaded rather than only a manually-vetted local file: an
+// extreme aspect ratio (e.g. a phone screenshot) clamped on width alone
+// could still come out over 1000px tall, and a receipt whose total height
+// (text + images) crosses a few thousand px is a confirmed real hardware
+// failure — see MAX_PAGE_HEIGHT's comment on the printer's raster parser
+// desyncing and printing garbled output instead of the image.
+function scaledDims(image, maxWidth, maxHeight) {
   if (!image) return null
-  const width = Math.min(image.width, maxWidth)
-  const height = image.height * (width / image.width)
-  return { width, height }
+  const scale = Math.min(1, maxWidth / image.width, maxHeight / image.height)
+  return { width: image.width * scale, height: image.height * scale }
 }
 
 // Optional restaurant logo printed at the top of RECEIPT tickets (not KOTs —
@@ -75,17 +170,27 @@ function scaledDims(image, maxWidth) {
 // if the file is missing.
 const LOGO_PATH = path.join(__dirname, 'assets', 'logo.png')
 const LOGO_MAX_WIDTH = 320
+const LOGO_MAX_HEIGHT = 320
 const LOGO_MARGIN_BOTTOM = 14
-const logo = loadImageAsset(LOGO_PATH)
+const logo = createImageAsset('logo', LOGO_PATH)
 const logoReady = logo.ready
 
 // Optional payment QR code printed near the total on RECEIPT tickets. Drop a
 // PNG/JPG at print-agent/assets/qr-payment.png to enable it.
 const QR_PATH = path.join(__dirname, 'assets', 'qr-payment.png')
 const QR_MAX_WIDTH = 260
+const QR_MAX_HEIGHT = 260
 const QR_MARGIN_TOP = 16
-const qr = loadImageAsset(QR_PATH)
+const qr = createImageAsset('qr', QR_PATH)
 const qrReady = qr.ready
+
+// Called by printer.js's refreshPrinterConfig() after each /api/printer-config
+// poll, with that tenant's current { logoUrl, paymentQrUrl } (either may be
+// null). Returns which images actually changed, for logging.
+async function syncBranding({ logoUrl, paymentQrUrl } = {}) {
+  const [logoChanged, qrChanged] = await Promise.all([logo.sync(logoUrl), qr.sync(paymentQrUrl)])
+  return { logoChanged, qrChanged }
+}
 
 function drawLine(ctx, y, text, opts = {}, textSize = 22) {
   const { size = textSize, bold = false, align = 'left' } = opts
@@ -141,10 +246,15 @@ function layoutReceipt(data, logoDims, qrDims, scale) {
   const ops = []
   let y = sz(20)
 
-  // Header
+  // Header — width/height go through sz() too (not just the margin below
+  // them), so the MAX_PAGE_HEIGHT shrink pass actually shrinks an oversized
+  // image along with the text instead of leaving it at full size while the
+  // text around it gets smaller.
   if (logoDims) {
-    ops.push({ image: logo.image, x: (WIDTH - logoDims.width) / 2, y, width: logoDims.width, height: logoDims.height })
-    y += logoDims.height + sz(LOGO_MARGIN_BOTTOM)
+    const w = sz(logoDims.width)
+    const h = sz(logoDims.height)
+    ops.push({ image: logo.image, x: (WIDTH - w) / 2, y, width: w, height: h })
+    y += h + sz(LOGO_MARGIN_BOTTOM)
   }
 
   if (data.restaurantName) {
@@ -225,8 +335,10 @@ function layoutReceipt(data, logoDims, qrDims, scale) {
   if (qrDims) {
     ops.push({ y, text: 'สแกนเพื่อชำระเงิน', opts: { size: sz(20), align: 'center' } })
     y += lineHeight
-    ops.push({ image: qr.image, x: (WIDTH - qrDims.width) / 2, y, width: qrDims.width, height: qrDims.height })
-    y += qrDims.height + sz(QR_MARGIN_TOP)
+    const w = sz(qrDims.width)
+    const h = sz(qrDims.height)
+    ops.push({ image: qr.image, x: (WIDTH - w) / 2, y, width: w, height: h })
+    y += h + sz(QR_MARGIN_TOP)
   }
 
   ops.push({ y, text: 'ขอบคุณที่ใช้บริการ', opts: { size: sz(20), align: 'center' } })
@@ -236,8 +348,8 @@ function layoutReceipt(data, logoDims, qrDims, scale) {
 }
 
 function renderReceiptImage(data) {
-  const logoDims = scaledDims(logo.image, LOGO_MAX_WIDTH)
-  const qrDims = scaledDims(qr.image, QR_MAX_WIDTH)
+  const logoDims = scaledDims(logo.image, LOGO_MAX_WIDTH, LOGO_MAX_HEIGHT)
+  const qrDims = scaledDims(qr.image, QR_MAX_WIDTH, QR_MAX_HEIGHT)
 
   let layout = layoutReceipt(data, logoDims, qrDims, 1)
   if (layout.height > MAX_PAGE_HEIGHT) {
@@ -318,4 +430,4 @@ function renderKotImage(data) {
   return canvas.toBuffer('image/png')
 }
 
-module.exports = { renderReceiptImage, renderKotImage, logoReady, qrReady }
+module.exports = { renderReceiptImage, renderKotImage, logoReady, qrReady, syncBranding }
