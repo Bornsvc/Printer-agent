@@ -1,7 +1,7 @@
 require('dotenv').config()
 const fetch = require('node-fetch')
 const { renderReceiptImage, renderKotImage, logoReady, qrReady } = require('./render')
-const { printReceiptImage, printKotImage, openCashDrawer, ready } = require('./printer')
+const { printReceiptImage, printKotImage, openCashDrawer, ready, getPrinterTarget } = require('./printer')
 
 const API_URL = process.env.API_URL
 const AGENT_SECRET = process.env.AGENT_SECRET
@@ -69,28 +69,31 @@ async function ackJob(jobId, status, error) {
 // and corrupt each other (each job's own execute() still resolves fine, since
 // the corruption happens on the printer's side, invisible to this process —
 // that's why jobs can show PRINTED in the DB while only one paper comes out).
-// This queues jobs per physical printer so same-station jobs run strictly
-// one-after-another, while different stations still print in parallel.
+// This queues jobs per physical printer so same-printer jobs run strictly
+// one-after-another, while different printers still print in parallel.
 //
 // execute() resolving only means the bytes were handed to the OS socket — it
 // does NOT mean the printer has finished physically feeding/cutting the
 // paper. Starting the next job's TCP connection while the printer is still
 // mid-cut can still corrupt/drop it even though nothing overlapped in Node.
-// PRINT_GAP_MS is a cooldown enforced between jobs on the same station to
+// PRINT_GAP_MS is a cooldown enforced between jobs on the same printer to
 // give the printer time to finish before the next one starts.
-const stationTails = new Map()
+const printerQueueTails = new Map()
 
-function runOnStationQueue(station, fn) {
-  const tail = stationTails.get(station) ?? Promise.resolve()
+// `queueKey` identifies the physical printer (see physicalKeyFor below), not
+// the station — `label` is only for the console log, so two stations
+// sharing one printer still read clearly in the output.
+function runOnPrinterQueue(queueKey, label, fn) {
+  const tail = printerQueueTails.get(queueKey) ?? Promise.resolve()
   const result = tail.then(fn, fn)
   const nextTail = result.then(
     () => {
-      console.log(`⏳ ${station}: job done, waiting ${PRINT_GAP_MS}ms before next in queue`)
+      console.log(`⏳ ${label}: job done, waiting ${PRINT_GAP_MS}ms before next in queue`)
       return sleep(PRINT_GAP_MS)
     },
     () => sleep(PRINT_GAP_MS)
   )
-  stationTails.set(station, nextTail.catch(() => {}))
+  printerQueueTails.set(queueKey, nextTail.catch(() => {}))
   return result
 }
 
@@ -101,12 +104,29 @@ function stationKeyFor(job, payload) {
   return 'RECEIPT'
 }
 
+// The actual physical printer a station currently resolves to — not just its
+// station name. Two different station names can be pointed at the same IP
+// (or the same COM port) from /admin/printers — nothing stops an admin from
+// wiring, say, HOT_KITCHEN and RECEIPT to one shared printer on a lean setup
+// — and queuing purely by station name would let jobs for those two names
+// open concurrent connections to what is, physically, the one printer this
+// whole queue exists to protect. Falls back to a station-scoped key when
+// nothing is configured yet, so an unconfigured station's jobs still queue
+// predictably against themselves rather than colliding with every other
+// unconfigured station on this same fallback key.
+function physicalKeyFor(station) {
+  const target = getPrinterTarget(station)
+  if (!target) return `unconfigured:${station}`
+  return target.connectionType === 'USB' ? `usb:${target.comPort}` : `lan:${target.ip}:${target.port}`
+}
+
 async function handleJob(job) {
   try {
     const payload = JSON.parse(job.payload)
     const station = stationKeyFor(job, payload)
+    const queueKey = physicalKeyFor(station)
 
-    await runOnStationQueue(station, async () => {
+    await runOnPrinterQueue(queueKey, station, async () => {
       console.log(`🖨️  ${station}: starting job ${job.id} (${job.type})`)
       if (job.type === 'RECEIPT') {
         const image = renderReceiptImage(payload)
@@ -170,4 +190,13 @@ async function main() {
   console.log(`✅ Polling for new print jobs every ${POLL_INTERVAL_MS / 1000}s...`)
 }
 
-main()
+// Only auto-starts when run directly (`node index.js`, or pm2 the same way)
+// — unchanged for that, the actual entrypoint. Guarding it means a test can
+// `require('../index.js')` to exercise physicalKeyFor/runOnPrinterQueue
+// against the real code instead of a reimplementation, without that require
+// itself kicking off real network polling.
+if (require.main === module) {
+  main()
+}
+
+module.exports = { physicalKeyFor, stationKeyFor, runOnPrinterQueue }

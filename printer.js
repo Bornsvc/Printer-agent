@@ -221,4 +221,14 @@ async function testBeep() {
   }
 }
 
-module.exports = { printReceiptImage, printKotImage, openCashDrawer, testBeep, ready }
+// Exposes the current station -> physical-printer mapping to index.js, so a
+// job's print queue can be keyed by what it actually talks to (ip:port or a
+// COM port) instead of just its station name — two different station names
+// can be pointed at the same physical printer from /admin/printers (e.g. a
+// lean single-printer setup), and nothing else would notice they're the same
+// device. Returns null for a station with no printer configured yet.
+function getPrinterTarget(station) {
+  return printerCache[station] ?? null
+}
+
+module.exports = { printReceiptImage, printKotImage, openCashDrawer, testBeep, ready, getPrinterTarget }
