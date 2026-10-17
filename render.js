@@ -49,9 +49,10 @@ const LINE_HEIGHT = 30
 const MARGIN = 16
 
 // Fixed labels printed on receipts/KOTs. Data from the API (restaurant name,
-// item names, notes, stationLabel, discountName) prints as-is in whatever
-// language it was entered in — only these hardcoded strings switch.
-// PRINT_LANGUAGE in .env picks the set; unset/unknown falls back to Thai.
+// notes, stationLabel, discountName) prints as-is in whatever language it was
+// entered in — only these hardcoded strings switch, plus item names (see
+// itemName below). PRINT_LANGUAGE in .env picks the set; unset/unknown falls
+// back to Thai.
 const LABELS = {
   th: {
     table: 'โต๊ะ',
@@ -95,6 +96,15 @@ const LABELS = {
 }
 const PRINT_LANGUAGE = (process.env.PRINT_LANGUAGE || 'th').trim().toLowerCase()
 const T = LABELS[PRINT_LANGUAGE] || LABELS.th
+
+// Item names: the API sends the base (Thai) `name` plus optional per-locale
+// `names` ({ lo, en } — only the ones an admin translated). Print the one for
+// PRINT_LANGUAGE when there is one, otherwise the base name. Older app
+// versions don't send `names` at all, which just means the base name.
+function itemName(item) {
+  const translated = item.names && item.names[PRINT_LANGUAGE]
+  return typeof translated === 'string' && translated.trim() ? translated : item.name
+}
 
 // Primary font follows PRINT_LANGUAGE (so Lao receipts get Lao-styled digits
 // and punctuation); the other font is the per-character fallback.
@@ -315,6 +325,45 @@ async function syncBranding({ logoUrl, paymentQrUrl } = {}) {
   return { logoChanged, qrChanged }
 }
 
+// Splits text into lines no wider than maxWidth at the given font size, so a
+// long item name (English names especially) wraps instead of running into
+// the price column or off the paper. Thai/Lao have no spaces between words,
+// so breaking uses Intl.Segmenter's dictionary word boundaries rather than
+// spaces, falling back to whole characters (graphemes — never splitting a
+// vowel/tone mark off its consonant) for a single word wider than the line.
+const measureCtx = createCanvas(1, 1).getContext('2d')
+const wordSegmenter = new Intl.Segmenter(PRINT_LANGUAGE, { granularity: 'word' })
+const graphemeSegmenter = new Intl.Segmenter(PRINT_LANGUAGE, { granularity: 'grapheme' })
+
+function wrapText(text, maxWidth, size, bold = false) {
+  measureCtx.font = `${bold ? 'bold ' : ''}${size}px ${FONT_STACK}`
+  const fits = (t) => measureCtx.measureText(t).width <= maxWidth
+  if (fits(text)) return [text]
+
+  const lines = []
+  let current = ''
+  for (const { segment } of wordSegmenter.segment(text)) {
+    if (fits(current + segment)) {
+      current += segment
+      continue
+    }
+    if (current.trim()) lines.push(current.trimEnd())
+    current = segment.trimStart()
+    // One word on its own is still too wide — break it by character.
+    while (!fits(current)) {
+      let head = ''
+      for (const { segment: ch } of graphemeSegmenter.segment(current)) {
+        if (!fits(head + ch) && head) break
+        head += ch
+      }
+      lines.push(head)
+      current = current.slice(head.length)
+    }
+  }
+  if (current.trim()) lines.push(current.trimEnd())
+  return lines
+}
+
 function drawLine(ctx, y, text, opts = {}, textSize = 22) {
   const { size = textSize, bold = false, align = 'left' } = opts
   ctx.font = `${bold ? 'bold ' : ''}${size}px ${FONT_STACK}`
@@ -396,9 +445,15 @@ function layoutReceipt(data, logoDims, qrDims, scale) {
 
   // Items
   for (const line of data.lines) {
-    ops.push({ y, text: `${line.quantity}x ${line.name}`, opts: { size: textSize, align: 'left' } })
-    ops.push({ y, text: line.lineTotal.toLocaleString(), opts: { size: textSize, align: 'right' } })
-    y += lineHeight
+    const price = line.lineTotal.toLocaleString()
+    measureCtx.font = `${textSize}px ${FONT_STACK}`
+    const nameWidth = WIDTH - MARGIN * 2 - measureCtx.measureText(price).width - sz(16)
+    const nameLines = wrapText(`${line.quantity}x ${itemName(line)}`, nameWidth, textSize)
+    ops.push({ y, text: price, opts: { size: textSize, align: 'right' } })
+    for (const text of nameLines) {
+      ops.push({ y, text, opts: { size: textSize, align: 'left' } })
+      y += lineHeight
+    }
   }
 
   // Totals
@@ -533,11 +588,15 @@ function renderKotImage(data) {
   y += 25
 
   for (const item of data.items) {
-    ops.push({ y, text: `${item.quantity}x ${item.name}`, opts: { size: 34, bold: true } })
-    y += KOT_LINE_HEIGHT
+    for (const text of wrapText(`${item.quantity}x ${itemName(item)}`, WIDTH - MARGIN * 2, 34, true)) {
+      ops.push({ y, text, opts: { size: 34, bold: true } })
+      y += KOT_LINE_HEIGHT
+    }
     if (item.note) {
-      ops.push({ y, text: `  * ${item.note}`, opts: { size: 24 } })
-      y += KOT_LINE_HEIGHT - 6
+      for (const text of wrapText(`  * ${item.note}`, WIDTH - MARGIN * 2, 24)) {
+        ops.push({ y, text, opts: { size: 24 } })
+        y += KOT_LINE_HEIGHT - 6
+      }
     }
   }
 
