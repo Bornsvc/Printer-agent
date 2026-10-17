@@ -21,9 +21,11 @@ const port = process.argv[3] || '9100'
 const sample = {
   tableNumber: `TEST ${ip}`,
   lines: [
-    { quantity: 1, name: 'ตำหลวงพระบาง', lineTotal: 70 },
-    { quantity: 1, name: 'คอหมูย่าง', lineTotal: 139 },
-    { quantity: 1, name: 'ข้าวเหนียว (1 กะติบ)', lineTotal: 30 },
+    // `names` mirrors what the web app sends, so PRINT_LANGUAGE=lo / en
+    // previews the translated names too.
+    { quantity: 1, name: 'ตำหลวงพระบาง', names: { lo: 'ຕໍາຫຼວງພະບາງ', en: 'Luang Prabang-Style Papaya Salad' }, lineTotal: 70 },
+    { quantity: 1, name: 'คอหมูย่าง', names: { lo: 'ຄໍໝູຍ່າງ', en: 'Grilled Pork Neck' }, lineTotal: 139 },
+    { quantity: 1, name: 'ข้าวเหนียว (1 กะติบ)', names: { lo: 'ເຂົ້າໜຽວ (1 ກະຕິບ)', en: 'Sticky Rice (1 Basket)' }, lineTotal: 30 },
   ],
   subtotal: 239,
   serviceCharge: 0,

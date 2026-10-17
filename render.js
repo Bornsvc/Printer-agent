@@ -97,6 +97,36 @@ const LABELS = {
 const PRINT_LANGUAGE = (process.env.PRINT_LANGUAGE || 'th').trim().toLowerCase()
 const T = LABELS[PRINT_LANGUAGE] || LABELS.th
 
+// Currency on printed amounts. Mirrors the web app's lib/currencies.ts.
+// PRINT_CURRENCY in .env (THB / LAK / USD) wins when set — it pins this
+// printer to one currency no matter what the job says. Otherwise the job's
+// own `currency` (the restaurant's setting in /admin/settings) is used, then
+// THB for jobs from app versions that don't send one.
+const CURRENCIES = {
+  THB: { symbol: '฿', decimals: 0 },
+  LAK: { symbol: '₭', decimals: 0 },
+  USD: { symbol: '$', decimals: 2 },
+}
+const PRINT_CURRENCY = (process.env.PRINT_CURRENCY || '').trim().toUpperCase()
+if (PRINT_CURRENCY && !CURRENCIES[PRINT_CURRENCY]) {
+  console.warn(`⚠️  Unknown PRINT_CURRENCY "${PRINT_CURRENCY}" — expected THB, LAK or USD. Ignoring it.`)
+}
+
+function currencyFor(data) {
+  return CURRENCIES[PRINT_CURRENCY] || CURRENCIES[data.currency] || CURRENCIES.THB
+}
+
+// Plain amount (line totals) and amount with symbol (subtotal, total, ...).
+function amount(value, cur) {
+  return Number(value).toLocaleString('en-US', {
+    minimumFractionDigits: cur.decimals,
+    maximumFractionDigits: cur.decimals,
+  })
+}
+function money(value, cur) {
+  return `${cur.symbol}${amount(value, cur)}`
+}
+
 // Item names: the API sends the base (Thai) `name` plus optional per-locale
 // `names` ({ lo, en } — only the ones an admin translated). Print the one for
 // PRINT_LANGUAGE when there is one, otherwise the base name. Older app
@@ -410,6 +440,7 @@ const MIN_RECEIPT_SCALE = 0.6
 // driven by the line-height increment, not the glyph size — so every
 // vertical measurement here (line height, gaps, margins) scales together.
 function layoutReceipt(data, logoDims, qrDims, scale) {
+  const cur = currencyFor(data)
   const sz = (px) => Math.round(px * scale)
   const lineHeight = sz(RECEIPT_LINE_HEIGHT)
   const textSize = sz(RECEIPT_TEXT_SIZE)
@@ -445,7 +476,7 @@ function layoutReceipt(data, logoDims, qrDims, scale) {
 
   // Items
   for (const line of data.lines) {
-    const price = line.lineTotal.toLocaleString()
+    const price = amount(line.lineTotal, cur)
     measureCtx.font = `${textSize}px ${FONT_STACK}`
     const nameWidth = WIDTH - MARGIN * 2 - measureCtx.measureText(price).width - sz(16)
     const nameLines = wrapText(`${line.quantity}x ${itemName(line)}`, nameWidth, textSize)
@@ -460,12 +491,12 @@ function layoutReceipt(data, logoDims, qrDims, scale) {
   ops.push({ divider: true, y })
   y += dividerGap
   ops.push({ y, text: T.subtotal, opts: { size: textSize, align: 'left' } })
-  ops.push({ y, text: `฿${data.subtotal.toLocaleString()}`, opts: { size: textSize, align: 'right' } })
+  ops.push({ y, text: money(data.subtotal, cur), opts: { size: textSize, align: 'right' } })
   y += lineHeight
 
   if (data.serviceCharge > 0) {
     ops.push({ y, text: T.serviceCharge, opts: { size: textSize, align: 'left' } })
-    ops.push({ y, text: `฿${data.serviceCharge.toLocaleString()}`, opts: { size: textSize, align: 'right' } })
+    ops.push({ y, text: money(data.serviceCharge, cur), opts: { size: textSize, align: 'right' } })
     y += lineHeight
   }
 
@@ -476,7 +507,7 @@ function layoutReceipt(data, logoDims, qrDims, scale) {
   if (data.isVip) {
     const label = data.vipChargeAmount > 0 ? `VIP Table (${data.vipDurationLabel})` : 'VIP Table Charge'
     ops.push({ y, text: label, opts: { size: textSize, align: 'left' } })
-    ops.push({ y, text: `฿${data.vipChargeAmount.toLocaleString()}`, opts: { size: textSize, align: 'right' } })
+    ops.push({ y, text: money(data.vipChargeAmount, cur), opts: { size: textSize, align: 'right' } })
     y += lineHeight
   }
 
@@ -484,7 +515,7 @@ function layoutReceipt(data, logoDims, qrDims, scale) {
   // in bill-actions.ts) — only present when a discount campaign was applied.
   if (data.discountAmount > 0) {
     ops.push({ y, text: `${T.discount} ${data.discountName} ${data.discountPercent}%`, opts: { size: textSize, align: 'left' } })
-    ops.push({ y, text: `-฿${data.discountAmount.toLocaleString()}`, opts: { size: textSize, align: 'right' } })
+    ops.push({ y, text: `-${money(data.discountAmount, cur)}`, opts: { size: textSize, align: 'right' } })
     y += lineHeight - sz(8)
     ops.push({ y, text: T.excludesDrinks, opts: { size: sz(16), align: 'left' } })
     y += lineHeight - sz(6)
@@ -492,7 +523,7 @@ function layoutReceipt(data, logoDims, qrDims, scale) {
 
   // Total
   ops.push({ y, text: T.total, opts: { size: sz(28), bold: true, align: 'left' } })
-  ops.push({ y, text: `฿${data.total.toLocaleString()}`, opts: { size: sz(28), bold: true, align: 'right' } })
+  ops.push({ y, text: money(data.total, cur), opts: { size: sz(28), bold: true, align: 'right' } })
   y += lineHeight + sz(14)
 
   // Payment — only present on the reprint fired after payment is confirmed
@@ -502,10 +533,10 @@ function layoutReceipt(data, logoDims, qrDims, scale) {
     ops.push({ divider: true, y })
     y += dividerGap
     ops.push({ y, text: T.received, opts: { size: textSize, align: 'left' } })
-    ops.push({ y, text: `฿${data.received.toLocaleString()}`, opts: { size: textSize, align: 'right' } })
+    ops.push({ y, text: money(data.received, cur), opts: { size: textSize, align: 'right' } })
     y += lineHeight
     ops.push({ y, text: T.change, opts: { size: textSize, align: 'left' } })
-    ops.push({ y, text: `฿${data.change.toLocaleString()}`, opts: { size: textSize, align: 'right' } })
+    ops.push({ y, text: money(data.change, cur), opts: { size: textSize, align: 'right' } })
     y += lineHeight + sz(14)
   }
 
