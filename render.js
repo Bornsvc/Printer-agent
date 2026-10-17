@@ -21,6 +21,23 @@ if (fs.existsSync(FONT_PATH)) {
   )
 }
 
+// Lao glyphs (ໂຕະ, ລວມທັງໝົດ, Lao item names...) — the Thai font has none,
+// so without this Lao text prints as blanks/tofu boxes. Registered under its
+// own family and listed alongside ThaiFont in FONT_STACK below, so each
+// character falls back to whichever font actually has it: Thai + Lao + digits
+// can all mix on the same line regardless of PRINT_LANGUAGE.
+const LAO_FONT_PATH = path.join(__dirname, 'fonts', 'NotoSansLao-VariableFont.ttf')
+const LAO_FONT_FAMILY = 'LaoFont'
+
+if (fs.existsSync(LAO_FONT_PATH)) {
+  GlobalFonts.registerFromPath(LAO_FONT_PATH, LAO_FONT_FAMILY)
+} else {
+  console.warn(
+    '⚠️  Lao font not found at print-agent/fonts/NotoSansLao-VariableFont.ttf — ' +
+      'Lao text will not render correctly until you add it.'
+  )
+}
+
 // 80mm thermal paper prints 576 dots wide at 203dpi (its printable area is
 // ~72mm — the rest is margin the printer itself reserves). ESC/POS image
 // printing does NOT center a narrower image on a wider print head; it just
@@ -78,6 +95,11 @@ const LABELS = {
 }
 const PRINT_LANGUAGE = (process.env.PRINT_LANGUAGE || 'th').trim().toLowerCase()
 const T = LABELS[PRINT_LANGUAGE] || LABELS.th
+
+// Primary font follows PRINT_LANGUAGE (so Lao receipts get Lao-styled digits
+// and punctuation); the other font is the per-character fallback.
+const FONT_STACK =
+  PRINT_LANGUAGE === 'lo' ? `${LAO_FONT_FAMILY}, ${FONT_FAMILY}` : `${FONT_FAMILY}, ${LAO_FONT_FAMILY}`
 
 const RECEIPT_LINE_HEIGHT = 46
 const RECEIPT_TEXT_SIZE = 36
@@ -295,7 +317,7 @@ async function syncBranding({ logoUrl, paymentQrUrl } = {}) {
 
 function drawLine(ctx, y, text, opts = {}, textSize = 22) {
   const { size = textSize, bold = false, align = 'left' } = opts
-  ctx.font = `${bold ? 'bold ' : ''}${size}px ${FONT_FAMILY}`
+  ctx.font = `${bold ? 'bold ' : ''}${size}px ${FONT_STACK}`
   ctx.fillStyle = '#000'
   ctx.textAlign = align
   const x = align === 'center' ? WIDTH / 2 : align === 'right' ? WIDTH - MARGIN : MARGIN
