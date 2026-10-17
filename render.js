@@ -62,6 +62,19 @@ const LABELS = {
     thankYou: 'Thank you',
     dateLocale: 'en-GB',
   },
+  lo: {
+    table: 'ໂຕະ',
+    subtotal: 'ລວມຍ່ອຍ',
+    serviceCharge: 'ຄ່າບໍລິການ',
+    discount: 'ສ່ວນຫຼຸດ',
+    excludesDrinks: 'ບໍ່ລວມເຄື່ອງດື່ມ',
+    total: 'ລວມທັງໝົດ',
+    received: 'ຮັບເງິນ',
+    change: 'ເງິນທອນ',
+    scanToPay: 'ສະແກນເພື່ອຊຳລະເງິນ',
+    thankYou: 'ຂອບໃຈທີ່ໃຊ້ບໍລິການ',
+    dateLocale: 'lo-LA',
+  }
 }
 const PRINT_LANGUAGE = (process.env.PRINT_LANGUAGE || 'th').trim().toLowerCase()
 const T = LABELS[PRINT_LANGUAGE] || LABELS.th
