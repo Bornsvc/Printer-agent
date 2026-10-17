@@ -31,6 +31,41 @@ const WIDTH = 576
 const LINE_HEIGHT = 30
 const MARGIN = 16
 
+// Fixed labels printed on receipts/KOTs. Data from the API (restaurant name,
+// item names, notes, stationLabel, discountName) prints as-is in whatever
+// language it was entered in — only these hardcoded strings switch.
+// PRINT_LANGUAGE in .env picks the set; unset/unknown falls back to Thai.
+const LABELS = {
+  th: {
+    table: 'โต๊ะ',
+    subtotal: 'รวมย่อย',
+    serviceCharge: 'ค่าบริการ',
+    discount: 'ส่วนลด',
+    excludesDrinks: 'ไม่รวมเครื่องดื่ม',
+    total: 'รวมทั้งหมด',
+    received: 'รับเงิน',
+    change: 'เงินทอน',
+    scanToPay: 'สแกนเพื่อชำระเงิน',
+    thankYou: 'ขอบคุณที่ใช้บริการ',
+    dateLocale: 'lo-LA',
+  },
+  en: {
+    table: 'Table',
+    subtotal: 'Subtotal',
+    serviceCharge: 'Service charge',
+    discount: 'Discount',
+    excludesDrinks: 'Excludes drinks',
+    total: 'Total',
+    received: 'Received',
+    change: 'Change',
+    scanToPay: 'Scan to pay',
+    thankYou: 'Thank you',
+    dateLocale: 'en-GB',
+  },
+}
+const PRINT_LANGUAGE = (process.env.PRINT_LANGUAGE || 'th').trim().toLowerCase()
+const T = LABELS[PRINT_LANGUAGE] || LABELS.th
+
 const RECEIPT_LINE_HEIGHT = 46
 const RECEIPT_TEXT_SIZE = 36
 
@@ -315,10 +350,10 @@ function layoutReceipt(data, logoDims, qrDims, scale) {
     y += lineHeight + sz(6)
   }
 
-  ops.push({ y, text: `โต๊ะ ${data.tableNumber}`, opts: { size: sz(34), bold: true, align: 'center' } })
+  ops.push({ y, text: `${T.table} ${data.tableNumber}`, opts: { size: sz(34), bold: true, align: 'center' } })
   y += lineHeight + sz(6)
 
-  ops.push({ y, text: new Date().toLocaleString('lo-LA'), opts: { size: sz(18), align: 'center' } })
+  ops.push({ y, text: new Date().toLocaleString(T.dateLocale), opts: { size: sz(18), align: 'center' } })
   y += lineHeight
 
   ops.push({ divider: true, y })
@@ -334,12 +369,12 @@ function layoutReceipt(data, logoDims, qrDims, scale) {
   // Totals
   ops.push({ divider: true, y })
   y += dividerGap
-  ops.push({ y, text: 'รวมย่อย', opts: { size: textSize, align: 'left' } })
+  ops.push({ y, text: T.subtotal, opts: { size: textSize, align: 'left' } })
   ops.push({ y, text: `฿${data.subtotal.toLocaleString()}`, opts: { size: textSize, align: 'right' } })
   y += lineHeight
 
   if (data.serviceCharge > 0) {
-    ops.push({ y, text: 'ค่าบริการ', opts: { size: textSize, align: 'left' } })
+    ops.push({ y, text: T.serviceCharge, opts: { size: textSize, align: 'left' } })
     ops.push({ y, text: `฿${data.serviceCharge.toLocaleString()}`, opts: { size: textSize, align: 'right' } })
     y += lineHeight
   }
@@ -358,15 +393,15 @@ function layoutReceipt(data, logoDims, qrDims, scale) {
   // Snapshotted onto the Bill at print time (see printBill/closeBillAndTable
   // in bill-actions.ts) — only present when a discount campaign was applied.
   if (data.discountAmount > 0) {
-    ops.push({ y, text: `ส่วนลด ${data.discountName} ${data.discountPercent}%`, opts: { size: textSize, align: 'left' } })
+    ops.push({ y, text: `${T.discount} ${data.discountName} ${data.discountPercent}%`, opts: { size: textSize, align: 'left' } })
     ops.push({ y, text: `-฿${data.discountAmount.toLocaleString()}`, opts: { size: textSize, align: 'right' } })
     y += lineHeight - sz(8)
-    ops.push({ y, text: 'ไม่รวมเครื่องดื่ม', opts: { size: sz(16), align: 'left' } })
+    ops.push({ y, text: T.excludesDrinks, opts: { size: sz(16), align: 'left' } })
     y += lineHeight - sz(6)
   }
 
   // Total
-  ops.push({ y, text: 'รวมทั้งหมด', opts: { size: sz(28), bold: true, align: 'left' } })
+  ops.push({ y, text: T.total, opts: { size: sz(28), bold: true, align: 'left' } })
   ops.push({ y, text: `฿${data.total.toLocaleString()}`, opts: { size: sz(28), bold: true, align: 'right' } })
   y += lineHeight + sz(14)
 
@@ -376,17 +411,17 @@ function layoutReceipt(data, logoDims, qrDims, scale) {
   if (data.received != null) {
     ops.push({ divider: true, y })
     y += dividerGap
-    ops.push({ y, text: 'รับเงิน', opts: { size: textSize, align: 'left' } })
+    ops.push({ y, text: T.received, opts: { size: textSize, align: 'left' } })
     ops.push({ y, text: `฿${data.received.toLocaleString()}`, opts: { size: textSize, align: 'right' } })
     y += lineHeight
-    ops.push({ y, text: 'เงินทอน', opts: { size: textSize, align: 'left' } })
+    ops.push({ y, text: T.change, opts: { size: textSize, align: 'left' } })
     ops.push({ y, text: `฿${data.change.toLocaleString()}`, opts: { size: textSize, align: 'right' } })
     y += lineHeight + sz(14)
   }
 
   // QR
   if (qrDims) {
-    ops.push({ y, text: 'สแกนเพื่อชำระเงิน', opts: { size: sz(20), align: 'center' } })
+    ops.push({ y, text: T.scanToPay, opts: { size: sz(20), align: 'center' } })
     y += lineHeight
     const w = sz(qrDims.width)
     const h = sz(qrDims.height)
@@ -394,7 +429,7 @@ function layoutReceipt(data, logoDims, qrDims, scale) {
     y += h + sz(QR_MARGIN_TOP)
   }
 
-  ops.push({ y, text: 'ขอบคุณที่ใช้บริการ', opts: { size: sz(20), align: 'center' } })
+  ops.push({ y, text: T.thankYou, opts: { size: sz(20), align: 'center' } })
   y += sz(8)
 
   return { ops, height: y + sz(20) }
@@ -443,7 +478,7 @@ function renderKotImage(data) {
   // otherwise the bigger glyphs overlap the next line.
   const KOT_LINE_HEIGHT = 44
 
-  ops.push({ y, text: `โต๊ะ ${data.tableNumber}`, opts: { size: 38, bold: true, align: 'center' } })
+  ops.push({ y, text: `${T.table} ${data.tableNumber}`, opts: { size: 38, bold: true, align: 'center' } })
   y += KOT_LINE_HEIGHT + 4
 
   // stationLabel is the Lao display text (see lib/actions/print-jobs.ts's
@@ -456,7 +491,7 @@ function renderKotImage(data) {
     y += KOT_LINE_HEIGHT
   }
 
-  ops.push({ y, text: new Date().toLocaleString('lo-LA'), opts: { size: 18, align: 'center' } })
+  ops.push({ y, text: new Date().toLocaleString(T.dateLocale), opts: { size: 18, align: 'center' } })
   y += KOT_LINE_HEIGHT
 
   ops.push({ divider: true, y })
