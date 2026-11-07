@@ -137,36 +137,72 @@ async function printImageBufferToStation(station, imageBuffer) {
   if (!target) {
     throw new Error(`ບໍ່ໄດ້ຕັ້ງຄ່າ IP ໃຫ້ ${station} — ໄປຕັ້ງໃນ /admin/printers`)
   }
+  // Audible cue that a job actually finished, since staff aren't always
+  // standing right at the printer to see paper come out.
+  //
+  // RECEIPT-only on purpose: scripts/test-beep.js has only ever confirmed
+  // this ESC/POS command against the RECEIPT printer. On an unverified
+  // model (the kitchen stations, still various clone units) a rejected or
+  // misinterpreted buzzer command can stall the printer's command
+  // processor mid-buffer and drop the job — invisibly, since execute()
+  // still resolves once the bytes are handed to the OS socket either way
+  // (see index.js's PRINT_GAP_MS comment). Enable per-station once that
+  // station's printer has been beep-tested the same way.
+  await printImageToTarget(target, imageBuffer, station, { beep: station === 'RECEIPT' })
+}
 
-  const tmpPath = path.join(os.tmpdir(), `print-${Date.now()}.png`)
+// Prints one PNG to an explicit printer target and cuts. Station jobs go
+// through printImageBufferToStation above; TEST jobs from /admin/printers'
+// found-printers list call this directly with the scanned target, since that
+// device isn't assigned to any station yet. `label` only names the printer in
+// error messages.
+async function printImageToTarget(target, imageBuffer, label, { beep = false } = {}) {
+  const tmpPath = path.join(os.tmpdir(), `print-${Date.now()}-${Math.random().toString(36).slice(2)}.png`)
   fs.writeFileSync(tmpPath, imageBuffer)
 
   try {
     const printer = createPrinterForTarget(target)
     await printer.printImage(tmpPath)
     printer.cut()
-    // Audible cue that a job actually finished, since staff aren't always
-    // standing right at the printer to see paper come out. Queued into the
-    // same command buffer as printImage/cut above — one execute() flushes
-    // all three together.
-    //
-    // RECEIPT-only on purpose: scripts/test-beep.js has only ever confirmed
-    // this ESC/POS command against the RECEIPT printer. On an unverified
-    // model (the kitchen stations, still various clone units) a rejected or
-    // misinterpreted buzzer command can stall the printer's command
-    // processor mid-buffer and drop the job — invisibly, since execute()
-    // still resolves once the bytes are handed to the OS socket either way
-    // (see index.js's PRINT_GAP_MS comment). Enable per-station once that
-    // station's printer has been beep-tested the same way.
-    if (station === 'RECEIPT') {
-      printer.beep()
-    }
+    // Queued into the same command buffer as printImage/cut above — one
+    // execute() flushes all of them together.
+    if (beep) printer.beep()
     await printer.execute()
   } catch (err) {
-    throw new Error(`Print failed for ${station} (${describeTarget(target)}): ${err.message}`)
+    throw new Error(`Print failed for ${label} (${describeTarget(target)}): ${err.message}`)
   } finally {
     fs.unlink(tmpPath, () => {})
   }
+}
+
+// A TEST job's target comes from the job payload, not from this agent's own
+// config — the server only queues targets its last scan reported, but the
+// agent still refuses anything that isn't a well-formed LAN or COM target
+// before opening a connection with it.
+const IPV4 = /^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/
+// Same RFC 1918 rule discovery.js scans by (and the web app enforces) — a
+// test print never leaves the restaurant's own private network.
+function isPrivateIPv4(ip) {
+  const [a, b] = ip.split('.').map(Number)
+  return a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168)
+}
+function parseTestTarget(raw) {
+  if (raw && raw.connectionType === 'USB' && /^COM[1-9]\d{0,2}$/i.test(raw.comPort || '')) {
+    return { connectionType: 'USB', comPort: raw.comPort.toUpperCase() }
+  }
+  const port = Number(raw && raw.port)
+  if (
+    raw &&
+    raw.connectionType === 'LAN' &&
+    IPV4.test(raw.ip || '') &&
+    isPrivateIPv4(raw.ip) &&
+    Number.isInteger(port) &&
+    port > 0 &&
+    port < 65536
+  ) {
+    return { connectionType: 'LAN', ip: raw.ip, port: String(port) }
+  }
+  return null
 }
 
 // renderReceiptImage returns an array of page buffers (usually just one) —
@@ -231,4 +267,14 @@ function getPrinterTarget(station) {
   return printerCache[station] ?? null
 }
 
-module.exports = { printReceiptImage, printKotImage, openCashDrawer, testBeep, ready, getPrinterTarget }
+module.exports = {
+  printReceiptImage,
+  printKotImage,
+  printImageBufferToStation,
+  printImageToTarget,
+  parseTestTarget,
+  openCashDrawer,
+  testBeep,
+  ready,
+  getPrinterTarget,
+}

@@ -2,6 +2,7 @@ const { createCanvas, GlobalFonts, Image } = require('@napi-rs/canvas')
 const path = require('path')
 const fs = require('fs')
 const fetch = require('node-fetch')
+const QRCode = require('qrcode')
 
 // ⚠️ REQUIRED: a Thai-capable font at print-agent/fonts/NotoSansThai-Regular.ttf
 // (full glyph set, not a script-only subset — subsetted downloads from Google
@@ -65,6 +66,9 @@ const LABELS = {
     change: 'เงินทอน',
     scanToPay: 'สแกนเพื่อชำระเงิน',
     thankYou: 'ขอบคุณที่ใช้บริการ',
+    scanToOrder: 'สแกนเพื่อสั่งอาหาร',
+    openedAt: 'เปิดโต๊ะ',
+    printerTest: 'ทดสอบเครื่องพิมพ์',
     dateLocale: 'lo-LA',
   },
   en: {
@@ -78,6 +82,9 @@ const LABELS = {
     change: 'Change',
     scanToPay: 'Scan to pay',
     thankYou: 'Thank you',
+    scanToOrder: 'Scan to order',
+    openedAt: 'Opened',
+    printerTest: 'Printer test',
     dateLocale: 'en-GB',
   },
   lo: {
@@ -91,6 +98,9 @@ const LABELS = {
     change: 'ເງິນທອນ',
     scanToPay: 'ສະແກນເພື່ອຊຳລະເງິນ',
     thankYou: 'ຂອບໃຈທີ່ໃຊ້ບໍລິການ',
+    scanToOrder: 'ສະແກນເພື່ອສັ່ງອາຫານ',
+    openedAt: 'ເປີດໂຕະ',
+    printerTest: 'ທົດສອບເຄື່ອງພິມ',
     dateLocale: 'lo-LA',
   }
 }
@@ -645,4 +655,89 @@ function renderKotImage(data) {
   return canvas.toBuffer('image/png')
 }
 
-module.exports = { renderReceiptImage, renderKotImage, logoReady, qrReady, syncBranding }
+// Per-session ordering QR slip (job type SESSION_QR — see the web app's
+// lib/table-session.ts enqueueSessionQrPrint): table number, the session's
+// order URL as a QR code, and when the table was opened. The QR is drawn
+// module-by-module as solid black squares rather than via the printer's own
+// ESC/POS QR command — many clone printers don't implement that command, and
+// drawing it keeps this slip on the same image path as every other job.
+const SESSION_QR_MODULE_DOTS = 10 // dots per QR module — ~1.25mm at 203dpi, easy for phone cameras
+const SESSION_QR_QUIET_MODULES = 4 // white border the QR spec requires around the code
+
+function renderSessionQrImage(data) {
+  const qr = QRCode.create(String(data.orderUrl), { errorCorrectionLevel: 'M' })
+  const modules = qr.modules.size
+  // Shrink modules for very long URLs so the code (plus quiet zone) still fits the paper.
+  const moduleDots = Math.max(
+    4,
+    Math.min(SESSION_QR_MODULE_DOTS, Math.floor((WIDTH - MARGIN * 2) / (modules + SESSION_QR_QUIET_MODULES * 2)))
+  )
+  const qrSize = modules * moduleDots
+
+  const ops = []
+  let y = 58
+  ops.push({ y, text: `${T.table} ${data.tableNumber}`, opts: { size: 44, bold: true, align: 'center' } })
+  y += 30
+  const qrTop = y + SESSION_QR_QUIET_MODULES * moduleDots
+  y = qrTop + qrSize + SESSION_QR_QUIET_MODULES * moduleDots + 34
+  ops.push({ y, text: T.scanToOrder, opts: { size: 32, bold: true, align: 'center' } })
+  y += 40
+  const opened = data.openedAt ? new Date(data.openedAt) : null
+  if (opened && !Number.isNaN(opened.getTime())) {
+    ops.push({ y, text: `${T.openedAt} ${opened.toLocaleString(T.dateLocale)}`, opts: { size: 20, align: 'center' } })
+    y += 30
+  }
+
+  const height = y + 20
+  const canvas = createCanvas(WIDTH, height)
+  const ctx = canvas.getContext('2d')
+  ctx.fillStyle = '#fff'
+  ctx.fillRect(0, 0, WIDTH, height)
+
+  const left = Math.round((WIDTH - qrSize) / 2)
+  ctx.fillStyle = '#000'
+  for (let row = 0; row < modules; row++) {
+    for (let col = 0; col < modules; col++) {
+      if (qr.modules.get(row, col)) ctx.fillRect(left + col * moduleDots, qrTop + row * moduleDots, moduleDots, moduleDots)
+    }
+  }
+  for (const op of ops) drawLine(ctx, op.y, op.text, op.opts)
+
+  return canvas.toBuffer('image/png')
+}
+
+// Short slip for a "Test print" sent from /admin/printers' found-printers
+// list (job type TEST) — prints the address it was sent to, so an admin
+// standing at a printer can tell which scanned address that printer is.
+function renderTestImage(data) {
+  const target = data.target || {}
+  const address = target.connectionType === 'USB' ? `USB ${target.comPort}` : `${target.ip}:${target.port}`
+  const lines = [
+    { text: T.printerTest, opts: { size: 36, bold: true, align: 'center' }, step: 52 },
+    { text: address, opts: { size: 40, bold: true, align: 'center' }, step: 48 },
+    { text: new Date().toLocaleString(T.dateLocale), opts: { size: 20, align: 'center' }, step: 30 },
+  ]
+  let y = 52
+  const ops = lines.map((l) => {
+    const op = { y, text: l.text, opts: l.opts }
+    y += l.step
+    return op
+  })
+  const height = y + 10
+  const canvas = createCanvas(WIDTH, height)
+  const ctx = canvas.getContext('2d')
+  ctx.fillStyle = '#fff'
+  ctx.fillRect(0, 0, WIDTH, height)
+  for (const op of ops) drawLine(ctx, op.y, op.text, op.opts)
+  return canvas.toBuffer('image/png')
+}
+
+module.exports = {
+  renderReceiptImage,
+  renderKotImage,
+  renderSessionQrImage,
+  renderTestImage,
+  logoReady,
+  qrReady,
+  syncBranding,
+}

@@ -1,7 +1,24 @@
 require('dotenv').config()
 const fetch = require('node-fetch')
-const { renderReceiptImage, renderKotImage, logoReady, qrReady } = require('./render')
-const { printReceiptImage, printKotImage, openCashDrawer, ready, getPrinterTarget } = require('./printer')
+const {
+  renderReceiptImage,
+  renderKotImage,
+  renderSessionQrImage,
+  renderTestImage,
+  logoReady,
+  qrReady,
+} = require('./render')
+const {
+  printReceiptImage,
+  printKotImage,
+  printImageBufferToStation,
+  printImageToTarget,
+  parseTestTarget,
+  openCashDrawer,
+  ready,
+  getPrinterTarget,
+} = require('./printer')
+const { runDiscovery } = require('./discovery')
 
 const API_URL = process.env.API_URL
 const AGENT_SECRET = process.env.AGENT_SECRET
@@ -97,8 +114,9 @@ function runOnPrinterQueue(queueKey, label, fn) {
   return result
 }
 
-// RECEIPT and DRAWER jobs both target the RECEIPT printer specifically —
-// they must serialize against each other too, not just against themselves.
+// RECEIPT, DRAWER and SESSION_QR jobs all target the RECEIPT printer
+// specifically — they must serialize against each other too, not just against
+// themselves. TEST jobs have no station (see queueTargetFor).
 function stationKeyFor(job, payload) {
   if (job.type === 'KOT') return payload.station
   return 'RECEIPT'
@@ -117,17 +135,35 @@ function stationKeyFor(job, payload) {
 function physicalKeyFor(station) {
   const target = getPrinterTarget(station)
   if (!target) return `unconfigured:${station}`
+  return targetKey(target)
+}
+
+function targetKey(target) {
   return target.connectionType === 'USB' ? `usb:${target.comPort}` : `lan:${target.ip}:${target.port}`
+}
+
+// Which printer queue a job runs on, and the label used in logs. A TEST job
+// (sent from /admin/printers' found-printers list) names its printer directly
+// instead of a station — it still has to queue on that physical printer, so a
+// test print can't interleave with a real receipt if the scanned device is
+// already one of the configured printers.
+function queueTargetFor(job, payload) {
+  if (job.type === 'TEST') {
+    const target = parseTestTarget(payload.target)
+    if (!target) throw new Error('Invalid test-print target')
+    return { queueKey: targetKey(target), label: `TEST ${targetKey(target)}`, target }
+  }
+  const station = stationKeyFor(job, payload)
+  return { queueKey: physicalKeyFor(station), label: station, target: null }
 }
 
 async function handleJob(job) {
   try {
     const payload = JSON.parse(job.payload)
-    const station = stationKeyFor(job, payload)
-    const queueKey = physicalKeyFor(station)
+    const { queueKey, label, target } = queueTargetFor(job, payload)
 
-    await runOnPrinterQueue(queueKey, station, async () => {
-      console.log(`🖨️  ${station}: starting job ${job.id} (${job.type})`)
+    await runOnPrinterQueue(queueKey, label, async () => {
+      console.log(`🖨️  ${label}: starting job ${job.id} (${job.type})`)
       if (job.type === 'RECEIPT') {
         const image = renderReceiptImage(payload)
         await retryPrintAction(() => printReceiptImage(image), `Receipt print for job ${job.id}`)
@@ -136,6 +172,18 @@ async function handleJob(job) {
         await retryPrintAction(() => printKotImage(payload.station, image), `KOT print for job ${job.id}`)
       } else if (job.type === 'DRAWER') {
         await openCashDrawer()
+      } else if (job.type === 'SESSION_QR') {
+        // Per-session ordering QR slip (web app: lib/table-session.ts).
+        const image = renderSessionQrImage(payload)
+        await retryPrintAction(
+          () => printImageBufferToStation('RECEIPT', image),
+          `Session QR print for job ${job.id}`
+        )
+      } else if (job.type === 'TEST') {
+        // One attempt only — an admin is waiting on the result next to the
+        // device on /admin/printers, and a scanned address that isn't really
+        // a printer should fail fast rather than retry for minutes.
+        await printImageToTarget(target, renderTestImage({ target }), 'TEST')
       } else {
         throw new Error(`Unknown job type: ${job.type}`)
       }
@@ -152,6 +200,27 @@ async function handleJob(job) {
 // Guards only the fetch itself against overlapping with the next tick.
 let pollInProgress = false
 
+// Last `discoveryRequestedAt` value seen from the server (an admin's "Scan
+// now"). Compared as an opaque value, never against this PC's clock — the
+// till PC's clock can be minutes off from the server's. `undefined` until the
+// first poll, which only records the value: the startup scan in main() already
+// covers any request made before this agent started.
+let lastSeenDiscoveryRequest
+
+function maybeStartRequestedScan(requestedAt) {
+  const value = requestedAt ?? null
+  if (lastSeenDiscoveryRequest === undefined) {
+    lastSeenDiscoveryRequest = value
+    return
+  }
+  if (value && value !== lastSeenDiscoveryRequest) {
+    lastSeenDiscoveryRequest = value
+    runDiscovery('requested from /admin/printers').catch((err) =>
+      console.error('⚠️  Requested printer scan failed:', err.message)
+    )
+  }
+}
+
 // Jobs currently being printed (possibly mid-retryPrintAction, which can run
 // for a few minutes). Dispatched without awaiting so a stuck job at one station
 // can't block polling or other stations' jobs — tracked here instead so the
@@ -167,6 +236,7 @@ async function poll() {
     })
     if (!res.ok) throw new Error(`Poll fetch failed: ${res.status}`)
     const data = await res.json()
+    maybeStartRequestedScan(data.discoveryRequestedAt)
     for (const job of data.jobs) {
       if (inFlightJobIds.has(job.id)) continue
       inFlightJobIds.add(job.id)
@@ -185,6 +255,8 @@ async function main() {
   console.log(`🖨️  Print agent starting — polling ${API_URL}`)
   await ready
   await Promise.all([logoReady, qrReady])
+  // Not awaited — a scan takes a few seconds and must never delay printing.
+  runDiscovery('startup').catch((err) => console.error('⚠️  Startup printer scan failed:', err.message))
   await poll()
   setInterval(poll, POLL_INTERVAL_MS)
   console.log(`✅ Polling for new print jobs every ${POLL_INTERVAL_MS / 1000}s...`)
@@ -199,4 +271,4 @@ if (require.main === module) {
   main()
 }
 
-module.exports = { physicalKeyFor, stationKeyFor, runOnPrinterQueue }
+module.exports = { physicalKeyFor, stationKeyFor, queueTargetFor, runOnPrinterQueue }
