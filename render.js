@@ -69,6 +69,8 @@ const LABELS = {
     scanToOrder: 'สแกนเพื่อสั่งอาหาร',
     openedAt: 'เปิดโต๊ะ',
     printerTest: 'ทดสอบเครื่องพิมพ์',
+    reprint: 'พิมพ์ซ้ำ',
+    originalTime: 'ใบเดิมเวลา',
     dateLocale: 'lo-LA',
   },
   en: {
@@ -85,6 +87,8 @@ const LABELS = {
     scanToOrder: 'Scan to order',
     openedAt: 'Opened',
     printerTest: 'Printer test',
+    reprint: 'REPRINT',
+    originalTime: 'Original',
     dateLocale: 'en-GB',
   },
   lo: {
@@ -101,6 +105,8 @@ const LABELS = {
     scanToOrder: 'ສະແກນເພື່ອສັ່ງອາຫານ',
     openedAt: 'ເປີດໂຕະ',
     printerTest: 'ທົດສອບເຄື່ອງພິມ',
+    reprint: 'ພິມຊ້ຳ',
+    originalTime: 'ໃບເດີມເວລາ',
     dateLocale: 'lo-LA',
   }
 }
@@ -449,6 +455,19 @@ const MIN_RECEIPT_SCALE = 0.6
 // would NOT shrink the total height — each line's vertical position is
 // driven by the line-height increment, not the glyph size — so every
 // vertical measurement here (line height, gaps, margins) scales together.
+// Staff reprints (web app: reprintPrintJobAction) carry `reprint: true` and the
+// original ticket's time. Printed as a banner at the very top so the kitchen
+// can tell a copy from a new order at a glance — never cook it twice.
+function reprintLines(data) {
+  if (!data.reprint) return []
+  const lines = [`*** ${T.reprint} ***`]
+  const original = data.originalCreatedAt ? new Date(data.originalCreatedAt) : null
+  if (original && !Number.isNaN(original.getTime())) {
+    lines.push(`${T.originalTime} ${original.toLocaleString(T.dateLocale)}`)
+  }
+  return lines
+}
+
 function layoutReceipt(data, logoDims, qrDims, scale) {
   const cur = currencyFor(data)
   const sz = (px) => Math.round(px * scale)
@@ -458,6 +477,16 @@ function layoutReceipt(data, logoDims, qrDims, scale) {
 
   const ops = []
   let y = sz(20)
+
+  // Text is drawn at its baseline but the logo at its top edge, so the gap
+  // after the banner depends on what comes next: a logo needs only a margin,
+  // a text line needs room for its own glyph height (incl. Thai/Lao marks).
+  for (const [i, text] of reprintLines(data).entries()) {
+    const size = i === 0 ? textSize : sz(22)
+    y += size + sz(8)
+    ops.push({ y, text, opts: { size, bold: i === 0, align: 'center' } })
+  }
+  if (data.reprint) y += logoDims ? sz(18) : sz(16) + (data.restaurantName ? textSize : sz(34))
 
   // Header — width/height go through sz() too (not just the margin below
   // them), so the MAX_PAGE_HEIGHT shrink pass actually shrinks an oversized
@@ -604,6 +633,13 @@ function renderKotImage(data) {
   // draw pass never recomputes a position, only replays what the dry pass logged.
   const ops = []
   let y = 36
+  // Banner first; extra top room so Thai/Lao upper marks aren't clipped.
+  if (data.reprint) y += 10
+  for (const [i, text] of reprintLines(data).entries()) {
+    ops.push({ y, text, opts: { size: i === 0 ? 34 : 20, bold: i === 0, align: 'center' } })
+    y += i === 0 ? 34 : 30
+  }
+  if (data.reprint) y += 24
   // Kitchen slips are read at a glance from across the pass, so KOT text runs
   // noticeably larger than receipt text — with a taller line height to match,
   // otherwise the bigger glyphs overlap the next line.
@@ -676,6 +712,11 @@ function renderSessionQrImage(data) {
 
   const ops = []
   let y = 58
+  for (const [i, text] of reprintLines(data).entries()) {
+    ops.push({ y, text, opts: { size: i === 0 ? 30 : 20, bold: i === 0, align: 'center' } })
+    y += i === 0 ? 32 : 30
+  }
+  if (data.reprint) y += 30
   ops.push({ y, text: `${T.table} ${data.tableNumber}`, opts: { size: 44, bold: true, align: 'center' } })
   y += 30
   const qrTop = y + SESSION_QR_QUIET_MODULES * moduleDots

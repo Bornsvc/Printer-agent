@@ -1,4 +1,5 @@
 const { ThermalPrinter, PrinterTypes } = require('node-thermal-printer')
+const net = require('net')
 const fetch = require('node-fetch')
 const fs = require('fs')
 const os = require('os')
@@ -90,6 +91,18 @@ function describeTarget(target) {
 
 const HEALTH_CHECK_INTERVAL_MS = 30_000
 
+// Identifies a physical printer — same scheme the web app's printer discovery
+// uses ("lan:ip:port" / "usb:COM3").
+function targetKey(target) {
+  return target.connectionType === 'USB' ? `usb:${target.comPort}` : `lan:${target.ip}:${target.port}`
+}
+
+const healthListeners = new Set()
+function onPrinterHealth(listener) {
+  healthListeners.add(listener)
+  return () => healthListeners.delete(listener)
+}
+
 // Periodic liveness probe — separate from actual printing, so staff can see
 // which printers are reachable without waiting for a real job to fail. LAN
 // targets get a real TCP connect/close via node-thermal-printer's
@@ -114,6 +127,21 @@ async function checkAllPrinters() {
     })
   )
 
+  // index.js's per-printer circuit breaker listens for ONLINE results to let a
+  // paused printer try its oldest job again (see onPrinterHealth below).
+  for (const r of results) {
+    const target = printerCache[r.station]
+    if (target) {
+      for (const listener of healthListeners) {
+        try {
+          listener({ ...r, targetKey: targetKey(target) })
+        } catch (err) {
+          console.error('⚠️  Printer health listener failed:', err.message)
+        }
+      }
+    }
+  }
+
   try {
     const res = await fetch(`${API_URL}/api/printer-status`, {
       method: 'POST',
@@ -132,11 +160,141 @@ ready.then(() => {
   setInterval(checkAllPrinters, HEALTH_CHECK_INTERVAL_MS)
 })
 
-async function printImageBufferToStation(station, imageBuffer) {
-  const target = printerCache[station]
-  if (!target) {
-    throw new Error(`ບໍ່ໄດ້ຕັ້ງຄ່າ IP ໃຫ້ ${station} — ໄປຕັ້ງໃນ /admin/printers`)
+// How long to wait for a printer to accept a connection / finish taking the
+// bytes. Same budget node-thermal-printer used (options.timeout above).
+const CONNECT_TIMEOUT_MS = 5000
+const WRITE_TIMEOUT_MS = 10_000
+
+// Whether a failed send may already have put paper through the printer.
+//   notSent: true  — the connection (or COM port) never opened, so nothing
+//                    reached the printer; safe to retry automatically.
+//   notSent: false — bytes were (or may have been) written; the printer may
+//                    have printed, or buffered the job to print later (e.g.
+//                    once paper is reloaded). Never resent automatically —
+//                    index.js reports it UNKNOWN for staff to decide.
+// This is why the agent sends bytes itself instead of calling execute():
+// node-thermal-printer reports a connect timeout and a mid-send timeout as the
+// same 'Socket timeout', and its COM-port writer keeps retrying in the
+// background for minutes after execute() has already rejected.
+class SendError extends Error {
+  constructor(message, { notSent }) {
+    super(message)
+    this.notSent = notSent
   }
+}
+
+// The job couldn't even be turned into printer bytes (bad image, disk error
+// writing the temp PNG) — nothing was sent, and retrying won't help.
+class BuildError extends Error {}
+
+function sendLan(target, buffer) {
+  return new Promise((resolve, reject) => {
+    let connected = false
+    let settled = false
+    const socket = new net.Socket()
+    const finish = (err) => {
+      if (settled) return
+      settled = true
+      clearTimeout(connectTimer)
+      clearTimeout(writeTimer)
+      socket.destroy()
+      if (err) reject(err)
+      else resolve()
+    }
+    const connectTimer = setTimeout(
+      () => finish(new SendError('Connection timed out', { notSent: true })),
+      CONNECT_TIMEOUT_MS
+    )
+    let writeTimer
+    socket.once('error', (err) =>
+      finish(new SendError(err.code || err.message, { notSent: !connected }))
+    )
+    socket.connect(Number(target.port), target.ip, () => {
+      connected = true
+      clearTimeout(connectTimer)
+      writeTimer = setTimeout(
+        () => finish(new SendError('Timed out while sending', { notSent: false })),
+        WRITE_TIMEOUT_MS
+      )
+      // Callback = bytes handed to the OS socket (same point node-thermal-printer
+      // treated as done). The printer may still be printing; PRINT_GAP_MS in
+      // index.js covers that.
+      socket.write(buffer, (err) => finish(err ? new SendError(err.message, { notSent: false }) : null))
+    })
+  })
+}
+
+function sendUsb(target, buffer) {
+  const devicePath = `\\\\.\\${target.comPort}`
+  return new Promise((resolve, reject) => {
+    let timedOut = false
+    const openTimer = setTimeout(() => {
+      timedOut = true
+      reject(new SendError(`Could not open ${target.comPort} in time`, { notSent: true }))
+    }, CONNECT_TIMEOUT_MS)
+    fs.open(devicePath, 'w', (openErr, fd) => {
+      clearTimeout(openTimer)
+      if (timedOut) {
+        // Gave up already and reported "not sent" — make sure that stays true.
+        if (!openErr) fs.close(fd, () => {})
+        return
+      }
+      if (openErr) {
+        reject(new SendError(openErr.code || openErr.message, { notSent: true }))
+        return
+      }
+      // A COM-port write can block indefinitely (printer offline mid-job),
+      // so it gets its own timer — otherwise this promise never settles and
+      // the printer's lane in index.js stays busy until the agent restarts.
+      let done = false
+      const settle = (err) => {
+        if (done) return
+        done = true
+        clearTimeout(writeTimer)
+        fs.close(fd, () => {})
+        if (err) reject(err)
+        else resolve()
+      }
+      const writeTimer = setTimeout(
+        () => settle(new SendError('Timed out while sending', { notSent: false })),
+        WRITE_TIMEOUT_MS
+      )
+      // fs.write may write fewer bytes than asked — keep going until all of
+      // the job is out, or report the partial write as ambiguous.
+      const writeFrom = (offset) => {
+        fs.write(fd, buffer, offset, buffer.length - offset, null, (writeErr, written) => {
+          if (writeErr) return settle(new SendError(writeErr.code || writeErr.message, { notSent: false }))
+          const next = offset + written
+          if (next >= buffer.length) return settle(null)
+          if (written === 0) return settle(new SendError('Printer stopped accepting data', { notSent: false }))
+          writeFrom(next)
+        })
+      }
+      writeFrom(0)
+    })
+  })
+}
+
+// Sends an already-built ESC/POS buffer to one printer, with a precise
+// "did anything reach the printer?" answer on failure (SendError.notSent).
+async function sendRaw(target, buffer, label) {
+  try {
+    if (target.connectionType === 'USB') await sendUsb(target, buffer)
+    else await sendLan(target, buffer)
+  } catch (err) {
+    const notSent = err instanceof SendError ? err.notSent : false
+    throw new SendError(`Print failed for ${label} (${describeTarget(target)}): ${err.message}`, { notSent })
+  }
+}
+
+function missingConfigError(station) {
+  // Nothing was sent — and once an admin fills the printer in, a retry works.
+  return new SendError(`ບໍ່ໄດ້ຕັ້ງຄ່າ IP ໃຫ້ ${station} — ໄປຕັ້ງໃນ /admin/printers`, { notSent: true })
+}
+
+async function printImageBufferToStation(station, imageBuffer, options = {}) {
+  const target = printerCache[station]
+  if (!target) throw missingConfigError(station)
   // Audible cue that a job actually finished, since staff aren't always
   // standing right at the printer to see paper come out.
   //
@@ -144,35 +302,40 @@ async function printImageBufferToStation(station, imageBuffer) {
   // this ESC/POS command against the RECEIPT printer. On an unverified
   // model (the kitchen stations, still various clone units) a rejected or
   // misinterpreted buzzer command can stall the printer's command
-  // processor mid-buffer and drop the job — invisibly, since execute()
-  // still resolves once the bytes are handed to the OS socket either way
+  // processor mid-buffer and drop the job — invisibly, since the send
+  // still succeeds once the bytes are handed to the OS socket either way
   // (see index.js's PRINT_GAP_MS comment). Enable per-station once that
   // station's printer has been beep-tested the same way.
-  await printImageToTarget(target, imageBuffer, station, { beep: station === 'RECEIPT' })
+  await printImageToTarget(target, imageBuffer, station, { beep: station === 'RECEIPT', ...options })
 }
 
-// Prints one PNG to an explicit printer target and cuts. Station jobs go
+// Prints one or more PNG pages to an explicit printer target, each followed by
+// a cut, as ONE send — so a multi-page job either goes out whole or fails
+// before anything was sent (no half-printed bill on retry). Station jobs go
 // through printImageBufferToStation above; TEST jobs from /admin/printers'
-// found-printers list call this directly with the scanned target, since that
-// device isn't assigned to any station yet. `label` only names the printer in
-// error messages.
-async function printImageToTarget(target, imageBuffer, label, { beep = false } = {}) {
-  const tmpPath = path.join(os.tmpdir(), `print-${Date.now()}-${Math.random().toString(36).slice(2)}.png`)
-  fs.writeFileSync(tmpPath, imageBuffer)
-
+// found-printers list call this directly with the scanned target. `label` only
+// names the printer in error messages.
+async function printImageToTarget(target, pages, label, { beep = false } = {}) {
+  const list = Array.isArray(pages) ? pages : [pages]
+  const printer = createPrinterForTarget(target)
+  const tmpPaths = []
   try {
-    const printer = createPrinterForTarget(target)
-    await printer.printImage(tmpPath)
-    printer.cut()
-    // Queued into the same command buffer as printImage/cut above — one
-    // execute() flushes all of them together.
+    for (const page of list) {
+      const tmpPath = path.join(os.tmpdir(), `print-${Date.now()}-${Math.random().toString(36).slice(2)}.png`)
+      fs.writeFileSync(tmpPath, page)
+      tmpPaths.push(tmpPath)
+      await printer.printImage(tmpPath)
+      printer.cut()
+    }
     if (beep) printer.beep()
-    await printer.execute()
   } catch (err) {
-    throw new Error(`Print failed for ${label} (${describeTarget(target)}): ${err.message}`)
+    // Turning the image into printer bytes failed — nothing was sent, and
+    // sending again won't fix the image. index.js fails it as a broken job.
+    throw new BuildError(`Could not prepare ${label} job: ${err.message}`)
   } finally {
-    fs.unlink(tmpPath, () => {})
+    for (const p of tmpPaths) fs.unlink(p, () => {})
   }
+  await sendRaw(target, printer.getBuffer(), label)
 }
 
 // A TEST job's target comes from the job payload, not from this agent's own
@@ -206,15 +369,10 @@ function parseTestTarget(raw) {
 }
 
 // renderReceiptImage returns an array of page buffers (usually just one) —
-// each gets printed and cut in sequence, on the same connection-per-call
-// pattern printImageBufferToStation already uses, so a bill too long for one
-// slip comes out as several instead of failing/garbling (see render.js's
-// MAX_PAGE_HEIGHT). Also accepts a bare single buffer for any older caller.
+// printed and cut in sequence within one send (see printImageToTarget). Also
+// accepts a bare single buffer for any older caller (scripts/test-*.js).
 async function printReceiptImage(pages) {
-  const list = Array.isArray(pages) ? pages : [pages]
-  for (const page of list) {
-    await printImageBufferToStation('RECEIPT', page)
-  }
+  await printImageBufferToStation('RECEIPT', pages)
 }
 
 async function printKotImage(station, imageBuffer) {
@@ -225,17 +383,10 @@ async function printKotImage(station, imageBuffer) {
 // opening it is just a pulse command, no image involved.
 async function openCashDrawer() {
   const target = printerCache['RECEIPT']
-  if (!target) {
-    throw new Error(`ບໍ່ໄດ້ຕັ້ງຄ່າ IP ໃຫ້ RECEIPT — ໄປຕັ້ງໃນ /admin/printers`)
-  }
-
-  try {
-    const printer = createPrinterForTarget(target)
-    printer.openCashDrawer()
-    await printer.execute()
-  } catch (err) {
-    throw new Error(`Drawer open failed for RECEIPT (${describeTarget(target)}): ${err.message}`)
-  }
+  if (!target) throw missingConfigError('RECEIPT')
+  const printer = createPrinterForTarget(target)
+  printer.openCashDrawer()
+  await sendRaw(target, printer.getBuffer(), 'RECEIPT drawer')
 }
 
 // Isolated buzzer test (see scripts/test-beep.js) — same ESC/POS command
@@ -244,17 +395,10 @@ async function openCashDrawer() {
 // without spending paper on a full test print each time.
 async function testBeep() {
   const target = printerCache['RECEIPT']
-  if (!target) {
-    throw new Error(`ບໍ່ໄດ້ຕັ້ງຄ່າ IP ໃຫ້ RECEIPT — ໄປຕັ້ງໃນ /admin/printers`)
-  }
-
-  try {
-    const printer = createPrinterForTarget(target)
-    printer.beep()
-    await printer.execute()
-  } catch (err) {
-    throw new Error(`Beep failed for RECEIPT (${describeTarget(target)}): ${err.message}`)
-  }
+  if (!target) throw missingConfigError('RECEIPT')
+  const printer = createPrinterForTarget(target)
+  printer.beep()
+  await sendRaw(target, printer.getBuffer(), 'RECEIPT beep')
 }
 
 // Exposes the current station -> physical-printer mapping to index.js, so a
@@ -277,4 +421,9 @@ module.exports = {
   testBeep,
   ready,
   getPrinterTarget,
+  targetKey,
+  onPrinterHealth,
+  SendError,
+  BuildError,
+  sendRaw,
 }

@@ -22,13 +22,31 @@ talks to the printers.
    a receipt layout or a kitchen ticket (KOT) layout.
 3. **Print.** The PNG is sent over TCP to the thermal printer assigned to that
    job's station (`RECEIPT`, or a kitchen station like `HOT_KITCHEN`).
-4. **Acknowledge.** The agent reports back via
-   `PATCH {API_URL}/api/print-jobs/:id` with `status: PRINTED` or
-   `status: FAILED` (plus an error message on failure), so the job isn't
-   picked up again next poll.
+4. **Acknowledge.** The agent claims each job first (`PATCH
+   {API_URL}/api/print-jobs/:id` with `status: PRINTING` — a 409 means another
+   agent or staff already has it, so it's skipped), then reports the outcome:
+   `PRINTED`; `RETRY_WAIT` (printer unreachable, nothing was sent — retried
+   automatically); `UNKNOWN` (bytes were sent but the send didn't finish
+   cleanly, so it may or may not have printed — never resent automatically,
+   staff decide on `/admin/printers`); or `FAILED` (the job itself is broken).
 
-A `pollInProgress` guard skips a tick if the previous one is still running
-(e.g. a slow print job), so the same job never gets fetched and printed twice.
+### Automatic retry
+Each physical printer has one lane that prints one job at a time, always the
+oldest ready ticket. A ticket whose printer can't be reached waits 5s, 15s,
+45s, then every 60s (`PRINT_RETRY_DELAYS_MS`) **without holding up the
+tickets behind it**; when its wait is over it is again the oldest, so it goes
+before anything newer. After 3 unreachable attempts in a row the printer is
+paused (circuit breaker) until the 30s health check sees it again or
+`BREAKER_PROBE_MS` passes; then one ticket is tried and, if it prints, the rest
+follow oldest-first. Tickets that wait too long are expired by the web app
+(kitchen tickets after 15 minutes) instead of printing late. Reprints made by
+staff carry `reprint: true` and print a `*** REPRINT ***` banner with the
+original time. `scripts/test-retry-lanes.js` exercises all of this against a
+mock web app and fake printers. Full rationale: the web app's
+`reports/POS print retry queue design.md`.
+
+A `pollInProgress` guard skips a tick if the previous one is still running, so
+a slow fetch never overlaps the next one.
 On startup, the agent waits for the printer config to load once (see
 `printer.js`) before it starts polling, so the very first tick doesn't race an
 empty printer cache.
@@ -39,8 +57,9 @@ empty printer cache.
 The entry point and the poll loop described above. Owns:
 - Reading `API_URL` / `AGENT_SECRET` / `POLL_INTERVAL_MS` from `.env`.
 - The `setInterval` poll loop and the `pollInProgress` guard.
-- `handleJob(job)` — dispatches a job to the right renderer + printer function
-  based on `job.type`, then acks it as `PRINTED`/`FAILED`:
+- The per-printer lanes, retry backoff and circuit breaker (see "Automatic
+  retry" above). `buildSend(job)` picks the renderer + printer function by
+  `job.type`:
   `RECEIPT`, `KOT`, `DRAWER` (cash drawer kick), `SESSION_QR` (per-session
   ordering QR slip, printed on the RECEIPT printer) and `TEST` (a test slip
   sent from `/admin/printers`' "Found printers" list straight to one scanned
@@ -48,7 +67,8 @@ The entry point and the poll loop described above. Owns:
   `SESSION_QR`/`TEST` jobs with "Unknown job type".
 - Starts a printer scan on startup, and again whenever the job poll's
   `discoveryRequestedAt` changes (an admin pressed "Scan" — see `discovery.js`).
-- `ackJob(id, status, error)` — the `PATCH` call back to the web app.
+- `report(id, body)` — the `PATCH` call back to the web app (retried a few
+  times, since a lost report would leave the job PRINTING on the server).
 
 Run with `node index.js` (or `npm start`).
 
@@ -69,9 +89,16 @@ Everything about talking to physical printers:
   (`/admin/printers`) takes effect without restarting the agent.
 - `ready` — a promise that resolves once that first config fetch has settled
   (success or failure). `index.js` awaits this before its first poll.
-- `printReceiptImage(buffer)` / `printKotImage(station, buffer)` — write the
-  PNG to a temp file and send it to the station's printer over
-  `tcp://ip:port` using `node-thermal-printer`, then cut the paper.
+- `printReceiptImage(buffer)` / `printKotImage(station, buffer)` — build the
+  ESC/POS bytes with `node-thermal-printer` (image + cut), then send them with
+  `sendRaw()`, which talks to the printer itself (TCP `ip:port`, or the
+  Windows COM port) instead of `execute()`. That's what lets a failure say
+  whether anything reached the printer: `SendError.notSent` is true only when
+  the connection/COM port never opened (safe to retry). `node-thermal-printer`
+  reports a connect timeout and a mid-send timeout identically, and its COM
+  writer keeps retrying in the background after `execute()` has given up.
+- `onPrinterHealth(listener)` — the 30s health ping results, used by
+  `index.js`'s circuit breaker to resume a paused printer.
 - Errors are wrapped with which station/IP failed
   (`Print failed for HOT_KITCHEN (192.168.1.50:9100): ...`) instead of surfacing
   a bare "Socket timeout", so a failed job's error message in the admin UI
