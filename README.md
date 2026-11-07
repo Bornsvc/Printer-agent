@@ -40,10 +40,26 @@ The entry point and the poll loop described above. Owns:
 - Reading `API_URL` / `AGENT_SECRET` / `POLL_INTERVAL_MS` from `.env`.
 - The `setInterval` poll loop and the `pollInProgress` guard.
 - `handleJob(job)` — dispatches a job to the right renderer + printer function
-  based on `job.type` (`RECEIPT` or `KOT`), then acks it as `PRINTED`/`FAILED`.
+  based on `job.type`, then acks it as `PRINTED`/`FAILED`:
+  `RECEIPT`, `KOT`, `DRAWER` (cash drawer kick), `SESSION_QR` (per-session
+  ordering QR slip, printed on the RECEIPT printer) and `TEST` (a test slip
+  sent from `/admin/printers`' "Found printers" list straight to one scanned
+  device — one attempt, no retries). Agents older than this version fail
+  `SESSION_QR`/`TEST` jobs with "Unknown job type".
+- Starts a printer scan on startup, and again whenever the job poll's
+  `discoveryRequestedAt` changes (an admin pressed "Scan" — see `discovery.js`).
 - `ackJob(id, status, error)` — the `PATCH` call back to the web app.
 
 Run with `node index.js` (or `npm start`).
+
+### `discovery.js`
+Finds printers this PC can reach so admins can pick one on `/admin/printers`
+instead of typing an IP: LAN hosts on this PC's own private `/24` network(s)
+with port 9100 open (a ~2s sweep), plus Windows COM ports (via PowerShell /
+`Win32_PnPEntity`). Results are POSTed to `{API_URL}/api/printer-discovery`.
+`node scripts/test-discovery.js` runs the same scan and just prints the
+result. Only RFC 1918 networks are scanned, and the sweep only opens and
+closes a TCP connection per host — nothing is printed.
 
 ### `printer.js`
 Everything about talking to physical printers:
@@ -102,6 +118,10 @@ Copy to `.env` and fill in:
   row in the web app's database (per-tenant now, not a shared env var), sent
   as the `x-agent-key` header on every request.
 - `POLL_INTERVAL_MS` — optional, defaults to `3000`.
+- `DISCOVERY_PORTS` — optional, comma-separated raw-print ports the printer
+  scan probes, defaults to `9100`.
+- `DISCOVERY_TIMEOUT_MS` — optional, per-host connect timeout for the scan,
+  defaults to `400`.
 
 Printer IPs are **not** set here — they're managed from `/admin/printers` in
 the web app and fetched automatically by `printer.js`.

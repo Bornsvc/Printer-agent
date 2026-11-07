@@ -3,12 +3,12 @@
 // just two real, publicly-reachable image URLs (e.g. ones just uploaded via
 // /admin/settings — see BillBrandingForm.tsx). Checks the full contract:
 // fetch+cache on first sync, skip-refetch when the URL hasn't changed,
-// revert to the local assets/logo.png / assets/qr-payment.png fallback when
-// unset, that the images actually get drawn into a rendered receipt, and
-// that a host which accepts the connection but never responds times out
-// instead of hanging the whole agent (see render.js's comment on why
-// asset.sync has a fetch timeout at all — this is the exact failure mode
-// that motivated it).
+// clearing to no image at all when reverted to unset (there's no generic
+// local-file fallback — each agent serves exactly one tenant), that the
+// images actually get drawn into a rendered receipt, and that a host which
+// accepts the connection but never responds times out instead of hanging
+// the whole agent (see render.js's comment on why asset.sync has a fetch
+// timeout at all — this is the exact failure mode that motivated it).
 //
 // Usage:
 //   node scripts/test-branding-sync.js <logoUrl> <paymentQrUrl>
@@ -49,16 +49,24 @@ function decodePng(pngBuffer) {
   return img
 }
 
-// Counts pixels darker than near-white anywhere in [yStart, yEnd) — a crude
-// but effective "something got drawn here" probe, since the receipt canvas
-// starts pure white and every draw op (text or image) darkens some pixels.
+// Checks for a pixel the PHYSICAL PRINTER would actually ink, not just one
+// that isn't perfectly white — this is the same 0.2126/0.7152/0.0722
+// luminance formula and 128 cutoff node-thermal-printer's EPSON driver uses
+// (node_modules/node-thermal-printer/lib/types/epson.js), applied here
+// deliberately, not the loose "< 250" near-white check this used to be. That
+// looser check would have reported ink for a logo whose every pixel was
+// grayscale 167-182 — visibly present in the PNG preview but literally zero
+// pixels below the printer's real threshold, so it printed as a blank patch
+// of paper. See render.js's ditherToBlackWhite for the fix (the logo draw op
+// is dithered before drawing specifically so it has real sub-128 pixels).
 function hasInkInBand(img, yStart, yEnd) {
   const canvas = createCanvas(img.width, img.height)
   const ctx = canvas.getContext('2d')
   ctx.drawImage(img, 0, 0)
   const { data } = ctx.getImageData(0, Math.max(0, yStart), img.width, Math.max(1, yEnd - yStart))
   for (let i = 0; i < data.length; i += 4) {
-    if (data[i] < 250 || data[i + 1] < 250 || data[i + 2] < 250) return true
+    const gray = 0.2126 * data[i] + 0.7152 * data[i + 1] + 0.0722 * data[i + 2]
+    if (gray < 128) return true
   }
   return false
 }
@@ -108,12 +116,21 @@ async function main() {
   const qrBandEnd = img.height - 60
   check('qr band has ink (before the closing line)', hasInkInBand(img, qrBandStart, qrBandEnd))
 
-  console.log('--- revert to unset (null, null): should fall back to local assets/*.png ---')
+  console.log('--- revert to unset (null, null): should print with no logo/QR at all ---')
   const reverted = await syncBranding({ logoUrl: null, paymentQrUrl: null })
   check('logo changed on revert to null', reverted.logoChanged === true)
   check('qr changed on revert to null', reverted.qrChanged === true)
   const cachedUrlFile = path.join(__dirname, '..', 'assets', 'cache', 'logo.url')
   check('logo.url cache cleared after revert', fs.readFileSync(cachedUrlFile, 'utf8').trim() === '')
+
+  // Not an ink-in-band check here — the table-number/timestamp text lines
+  // always land in that same early y-range regardless of the logo, so
+  // "no ink" would never hold for this sample data. The height delta is the
+  // reliable signal: it only shrinks by exactly the omitted image blocks'
+  // height if the logo/QR sections were actually skipped, not just faded.
+  const withoutBranding = renderReceiptImage(sample)[0]
+  const imgNoBranding = decodePng(withoutBranding)
+  check('receipt is shorter with branding off than with it on', imgNoBranding.height < img.height)
 
   console.log('--- re-sync with a deliberately unreachable URL (fails fast): should keep last good image ---')
   const failedSync = await syncBranding({ logoUrl: 'http://127.0.0.1:1/nope.png', paymentQrUrl })

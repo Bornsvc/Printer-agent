@@ -2,6 +2,7 @@ const { createCanvas, GlobalFonts, Image } = require('@napi-rs/canvas')
 const path = require('path')
 const fs = require('fs')
 const fetch = require('node-fetch')
+const QRCode = require('qrcode')
 
 // ⚠️ REQUIRED: a Thai-capable font at print-agent/fonts/NotoSansThai-Regular.ttf
 // (full glyph set, not a script-only subset — subsetted downloads from Google
@@ -21,6 +22,23 @@ if (fs.existsSync(FONT_PATH)) {
   )
 }
 
+// Lao glyphs (ໂຕະ, ລວມທັງໝົດ, Lao item names...) — the Thai font has none,
+// so without this Lao text prints as blanks/tofu boxes. Registered under its
+// own family and listed alongside ThaiFont in FONT_STACK below, so each
+// character falls back to whichever font actually has it: Thai + Lao + digits
+// can all mix on the same line regardless of PRINT_LANGUAGE.
+const LAO_FONT_PATH = path.join(__dirname, 'fonts', 'NotoSansLao-VariableFont.ttf')
+const LAO_FONT_FAMILY = 'LaoFont'
+
+if (fs.existsSync(LAO_FONT_PATH)) {
+  GlobalFonts.registerFromPath(LAO_FONT_PATH, LAO_FONT_FAMILY)
+} else {
+  console.warn(
+    '⚠️  Lao font not found at print-agent/fonts/NotoSansLao-VariableFont.ttf — ' +
+      'Lao text will not render correctly until you add it.'
+  )
+}
+
 // 80mm thermal paper prints 576 dots wide at 203dpi (its printable area is
 // ~72mm — the rest is margin the printer itself reserves). ESC/POS image
 // printing does NOT center a narrower image on a wider print head; it just
@@ -30,6 +48,108 @@ if (fs.existsSync(FONT_PATH)) {
 const WIDTH = 576
 const LINE_HEIGHT = 30
 const MARGIN = 16
+
+// Fixed labels printed on receipts/KOTs. Data from the API (restaurant name,
+// notes, stationLabel, discountName) prints as-is in whatever language it was
+// entered in — only these hardcoded strings switch, plus item names (see
+// itemName below). PRINT_LANGUAGE in .env picks the set; unset/unknown falls
+// back to Thai.
+const LABELS = {
+  th: {
+    table: 'โต๊ะ',
+    subtotal: 'รวมย่อย',
+    serviceCharge: 'ค่าบริการ',
+    discount: 'ส่วนลด',
+    excludesDrinks: 'ไม่รวมเครื่องดื่ม',
+    total: 'รวมทั้งหมด',
+    received: 'รับเงิน',
+    change: 'เงินทอน',
+    scanToPay: 'สแกนเพื่อชำระเงิน',
+    thankYou: 'ขอบคุณที่ใช้บริการ',
+    scanToOrder: 'สแกนเพื่อสั่งอาหาร',
+    openedAt: 'เปิดโต๊ะ',
+    printerTest: 'ทดสอบเครื่องพิมพ์',
+    dateLocale: 'lo-LA',
+  },
+  en: {
+    table: 'Table',
+    subtotal: 'Subtotal',
+    serviceCharge: 'Service charge',
+    discount: 'Discount',
+    excludesDrinks: 'Excludes drinks',
+    total: 'Total',
+    received: 'Received',
+    change: 'Change',
+    scanToPay: 'Scan to pay',
+    thankYou: 'Thank you',
+    scanToOrder: 'Scan to order',
+    openedAt: 'Opened',
+    printerTest: 'Printer test',
+    dateLocale: 'en-GB',
+  },
+  lo: {
+    table: 'ໂຕະ',
+    subtotal: 'ລວມຍ່ອຍ',
+    serviceCharge: 'ຄ່າບໍລິການ',
+    discount: 'ສ່ວນຫຼຸດ',
+    excludesDrinks: 'ບໍ່ລວມເຄື່ອງດື່ມ',
+    total: 'ລວມທັງໝົດ',
+    received: 'ຮັບເງິນ',
+    change: 'ເງິນທອນ',
+    scanToPay: 'ສະແກນເພື່ອຊຳລະເງິນ',
+    thankYou: 'ຂອບໃຈທີ່ໃຊ້ບໍລິການ',
+    scanToOrder: 'ສະແກນເພື່ອສັ່ງອາຫານ',
+    openedAt: 'ເປີດໂຕະ',
+    printerTest: 'ທົດສອບເຄື່ອງພິມ',
+    dateLocale: 'lo-LA',
+  }
+}
+const PRINT_LANGUAGE = (process.env.PRINT_LANGUAGE || 'th').trim().toLowerCase()
+const T = LABELS[PRINT_LANGUAGE] || LABELS.th
+
+// Currency on printed amounts. Mirrors the web app's lib/currencies.ts.
+// PRINT_CURRENCY in .env (THB / LAK / USD) wins when set — it pins this
+// printer to one currency no matter what the job says. Otherwise the job's
+// own `currency` (the restaurant's setting in /admin/settings) is used, then
+// THB for jobs from app versions that don't send one.
+const CURRENCIES = {
+  THB: { symbol: '฿', decimals: 0 },
+  LAK: { symbol: '₭', decimals: 0 },
+  USD: { symbol: '$', decimals: 2 },
+}
+const PRINT_CURRENCY = (process.env.PRINT_CURRENCY || '').trim().toUpperCase()
+if (PRINT_CURRENCY && !CURRENCIES[PRINT_CURRENCY]) {
+  console.warn(`⚠️  Unknown PRINT_CURRENCY "${PRINT_CURRENCY}" — expected THB, LAK or USD. Ignoring it.`)
+}
+
+function currencyFor(data) {
+  return CURRENCIES[PRINT_CURRENCY] || CURRENCIES[data.currency] || CURRENCIES.THB
+}
+
+// Plain amount (line totals) and amount with symbol (subtotal, total, ...).
+function amount(value, cur) {
+  return Number(value).toLocaleString('en-US', {
+    minimumFractionDigits: cur.decimals,
+    maximumFractionDigits: cur.decimals,
+  })
+}
+function money(value, cur) {
+  return `${cur.symbol}${amount(value, cur)}`
+}
+
+// Item names: the API sends the base (Thai) `name` plus optional per-locale
+// `names` ({ lo, en } — only the ones an admin translated). Print the one for
+// PRINT_LANGUAGE when there is one, otherwise the base name. Older app
+// versions don't send `names` at all, which just means the base name.
+function itemName(item) {
+  const translated = item.names && item.names[PRINT_LANGUAGE]
+  return typeof translated === 'string' && translated.trim() ? translated : item.name
+}
+
+// Primary font follows PRINT_LANGUAGE (so Lao receipts get Lao-styled digits
+// and punctuation); the other font is the per-character fallback.
+const FONT_STACK =
+  PRINT_LANGUAGE === 'lo' ? `${LAO_FONT_FAMILY}, ${FONT_FAMILY}` : `${FONT_FAMILY}, ${LAO_FONT_FAMILY}`
 
 const RECEIPT_LINE_HEIGHT = 46
 const RECEIPT_TEXT_SIZE = 36
@@ -41,27 +161,29 @@ const RECEIPT_TEXT_SIZE = 36
 // can't reintroduce the same overlap.
 const RECEIPT_DIVIDER_GAP = Math.round(RECEIPT_TEXT_SIZE * 1.14)
 
-// Runtime-refreshable image asset (logo, payment QR — both optional, both
-// per-tenant since the tenant-provisioning multi-restaurant update). A
-// tenant sets these from /admin/settings in the main app rather than
-// touching this machine's filesystem; printer.js polls /api/printer-config
-// every 60s and calls sync(url) here with whatever that tenant currently has
-// configured (or null). Falls back to the local assetPath convention below
-// when unset, so an install that's never used the web UI keeps working
-// exactly as before. Caches the last-synced remote image to disk (under
-// assets/cache/) so a network hiccup — or the agent restarting — doesn't
-// blank out receipts; sync() only re-fetches when the URL actually changed.
+// Runtime-refreshable image asset (logo, payment QR — both optional,
+// per-tenant). A tenant sets these from /admin/settings in the main app;
+// printer.js polls /api/printer-config every 60s and calls sync(url) here
+// with whatever that tenant currently has configured. Unset (null) means no
+// image at all — this agent serves whichever tenant its own agentKey
+// belongs to, so there's no sensible "generic fallback image" to show a
+// restaurant that hasn't set its own; layoutReceipt already skips the whole
+// logo/QR block when `.image` is null, so an unconfigured tenant's receipts
+// just print without one, same as before this feature existed. Caches the
+// last-synced remote image to disk (under assets/cache/) so a network
+// hiccup — or the agent restarting — doesn't blank out a tenant's real,
+// already-configured branding; sync() only re-fetches when the URL changed.
 //
 // img.complete reports true the instant src is set, but drawImage silently
 // paints nothing until decode() actually resolves — so callers must await
 // `ready` before the first receipt is rendered, or the image draws blank.
 const CACHE_DIR = path.join(__dirname, 'assets', 'cache')
 
-function createImageAsset(name, assetPath) {
+function createImageAsset(name) {
   const cacheBinPath = path.join(CACHE_DIR, `${name}.bin`)
   const cacheUrlPath = path.join(CACHE_DIR, `${name}.url`)
   const asset = { image: null }
-  let currentUrl = null // null = currently showing the local assetPath fallback (or nothing)
+  let currentUrl = null // null = no image configured (or the fetch for it never succeeded)
 
   async function decode(buf) {
     const img = new Image()
@@ -70,34 +192,19 @@ function createImageAsset(name, assetPath) {
     return img
   }
 
-  async function loadLocalFallback() {
-    if (!fs.existsSync(assetPath)) {
-      asset.image = null
-      return
-    }
-    try {
-      asset.image = await decode(fs.readFileSync(assetPath))
-    } catch (err) {
-      console.warn(`⚠️  Failed to load ${path.basename(assetPath)}:`, err.message)
-      asset.image = null
-    }
-  }
-
-  // Best-effort initial load: prefer a previously-cached remote image (so a
-  // restart doesn't blank branding while waiting on the next network sync),
-  // else the local fallback file. Never throws.
+  // Best-effort initial load from a previously-cached remote image, so a
+  // restart doesn't blank a tenant's real branding while waiting on the
+  // next network sync. No cache yet (or unreadable) just means no image
+  // until the first successful sync() — never throws.
   asset.ready = (async () => {
     const cachedUrl = fs.existsSync(cacheUrlPath) ? fs.readFileSync(cacheUrlPath, 'utf8').trim() : ''
-    if (cachedUrl && fs.existsSync(cacheBinPath)) {
-      try {
-        asset.image = await decode(fs.readFileSync(cacheBinPath))
-        currentUrl = cachedUrl
-        return
-      } catch (err) {
-        console.warn(`⚠️  Cached ${name} image unreadable, falling back:`, err.message)
-      }
+    if (!cachedUrl || !fs.existsSync(cacheBinPath)) return
+    try {
+      asset.image = await decode(fs.readFileSync(cacheBinPath))
+      currentUrl = cachedUrl
+    } catch (err) {
+      console.warn(`⚠️  Cached ${name} image unreadable:`, err.message)
     }
-    await loadLocalFallback()
   })()
 
   // Called by printer.js after each /api/printer-config poll. Returns
@@ -117,16 +224,15 @@ function createImageAsset(name, assetPath) {
     if (next === currentUrl) return false
 
     if (!next) {
+      asset.image = null
+      currentUrl = null
       try {
-        await loadLocalFallback()
-        currentUrl = null
         fs.mkdirSync(CACHE_DIR, { recursive: true })
         fs.writeFileSync(cacheUrlPath, '')
-        return true
       } catch (err) {
-        console.warn(`⚠️  Failed to revert ${name} to local fallback:`, err.message)
-        return false
+        console.warn(`⚠️  Failed to clear cached ${name} image:`, err.message)
       }
+      return true
     }
 
     try {
@@ -164,24 +270,91 @@ function scaledDims(image, maxWidth, maxHeight) {
   return { width: image.width * scale, height: image.height * scale }
 }
 
+// Converts an image to pure black/white via Floyd-Steinberg error-diffusion
+// dithering, composited onto a white background first (so a transparent
+// background — e.g. from a background-removal tool — becomes "no ink", not
+// black). This exists because the physical printer's own image conversion
+// (node-thermal-printer's EPSON driver, in node_modules — not our code) does
+// a hard per-pixel luminance threshold with no dithering at all: every pixel
+// below 128 grayscale prints as ink, everything else prints as nothing.
+// A logo in light/pastel colors can have EVERY pixel above that threshold —
+// confirmed on a real uploaded logo (solid gold/orange text, grayscale
+// 167-182 throughout) — so it renders correctly in the PNG preview shown in
+// /admin/settings but prints as a completely blank patch of paper, not just
+// faded. Dithering spreads each pixel's rounding error to its neighbors, so
+// a mid-tone color comes out as a recognizable stippled pattern instead of
+// vanishing outright. Runs fresh per receipt render (at whatever the logo's
+// final on-paper size is) rather than once at sync time, since MAX_PAGE_HEIGHT's
+// shrink pass can change that size receipt to receipt — dithering a fixed
+// source size and later resizing it would just reintroduce the same soft
+// gray edges dithering exists to remove. Cheap enough either way: at most
+// LOGO_MAX_WIDTH x LOGO_MAX_HEIGHT (320x320) pixels.
+//
+// Deliberately not used for the QR code — a real QR is already black/white,
+// so there's no washing-out problem to fix, and this codebase already treats
+// "don't distort a QR's fine modules" as a hard rule (see scaledDims' own
+// comment above): dithering's error diffusion could bleed across module
+// edges exactly where downscaling has already softened them, which is a
+// risk worth avoiding for zero benefit on an image that doesn't need it.
+function ditherToBlackWhite(image, width, height) {
+  const w = Math.max(1, Math.round(width))
+  const h = Math.max(1, Math.round(height))
+  const canvas = createCanvas(w, h)
+  const ctx = canvas.getContext('2d')
+  ctx.fillStyle = '#fff'
+  ctx.fillRect(0, 0, w, h)
+  ctx.drawImage(image, 0, 0, w, h)
+
+  const imageData = ctx.getImageData(0, 0, w, h)
+  const data = imageData.data
+  const gray = new Float32Array(w * h)
+  for (let i = 0, p = 0; i < data.length; i += 4, p++) {
+    gray[p] = 0.2126 * data[i] + 0.7152 * data[i + 1] + 0.0722 * data[i + 2]
+  }
+
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const i = y * w + x
+      const old = gray[i]
+      const black = old < 128
+      const err = old - (black ? 0 : 255)
+
+      if (x + 1 < w) gray[i + 1] += (err * 7) / 16
+      if (y + 1 < h) {
+        if (x > 0) gray[i - 1 + w] += (err * 3) / 16
+        gray[i + w] += (err * 5) / 16
+        if (x + 1 < w) gray[i + 1 + w] += (err * 1) / 16
+      }
+
+      const out = black ? 0 : 255
+      const di = i * 4
+      data[di] = out
+      data[di + 1] = out
+      data[di + 2] = out
+      data[di + 3] = 255
+    }
+  }
+
+  ctx.putImageData(imageData, 0, 0)
+  return canvas
+}
+
 // Optional restaurant logo printed at the top of RECEIPT tickets (not KOTs —
-// kitchen slips stay logo-free to save paper/time). Drop a PNG/JPG at
-// print-agent/assets/logo.png to enable it; receipts print without a logo
-// if the file is missing.
-const LOGO_PATH = path.join(__dirname, 'assets', 'logo.png')
+// kitchen slips stay logo-free to save paper/time). Set from /admin/settings
+// (see BillBrandingForm.tsx); receipts print without a logo until a tenant
+// uploads one.
 const LOGO_MAX_WIDTH = 320
 const LOGO_MAX_HEIGHT = 320
 const LOGO_MARGIN_BOTTOM = 14
-const logo = createImageAsset('logo', LOGO_PATH)
+const logo = createImageAsset('logo')
 const logoReady = logo.ready
 
-// Optional payment QR code printed near the total on RECEIPT tickets. Drop a
-// PNG/JPG at print-agent/assets/qr-payment.png to enable it.
-const QR_PATH = path.join(__dirname, 'assets', 'qr-payment.png')
+// Optional payment QR code printed near the total on RECEIPT tickets. Set
+// from /admin/settings, same as the logo above.
 const QR_MAX_WIDTH = 260
 const QR_MAX_HEIGHT = 260
 const QR_MARGIN_TOP = 16
-const qr = createImageAsset('qr', QR_PATH)
+const qr = createImageAsset('qr')
 const qrReady = qr.ready
 
 // Called by printer.js's refreshPrinterConfig() after each /api/printer-config
@@ -192,9 +365,48 @@ async function syncBranding({ logoUrl, paymentQrUrl } = {}) {
   return { logoChanged, qrChanged }
 }
 
+// Splits text into lines no wider than maxWidth at the given font size, so a
+// long item name (English names especially) wraps instead of running into
+// the price column or off the paper. Thai/Lao have no spaces between words,
+// so breaking uses Intl.Segmenter's dictionary word boundaries rather than
+// spaces, falling back to whole characters (graphemes — never splitting a
+// vowel/tone mark off its consonant) for a single word wider than the line.
+const measureCtx = createCanvas(1, 1).getContext('2d')
+const wordSegmenter = new Intl.Segmenter(PRINT_LANGUAGE, { granularity: 'word' })
+const graphemeSegmenter = new Intl.Segmenter(PRINT_LANGUAGE, { granularity: 'grapheme' })
+
+function wrapText(text, maxWidth, size, bold = false) {
+  measureCtx.font = `${bold ? 'bold ' : ''}${size}px ${FONT_STACK}`
+  const fits = (t) => measureCtx.measureText(t).width <= maxWidth
+  if (fits(text)) return [text]
+
+  const lines = []
+  let current = ''
+  for (const { segment } of wordSegmenter.segment(text)) {
+    if (fits(current + segment)) {
+      current += segment
+      continue
+    }
+    if (current.trim()) lines.push(current.trimEnd())
+    current = segment.trimStart()
+    // One word on its own is still too wide — break it by character.
+    while (!fits(current)) {
+      let head = ''
+      for (const { segment: ch } of graphemeSegmenter.segment(current)) {
+        if (!fits(head + ch) && head) break
+        head += ch
+      }
+      lines.push(head)
+      current = current.slice(head.length)
+    }
+  }
+  if (current.trim()) lines.push(current.trimEnd())
+  return lines
+}
+
 function drawLine(ctx, y, text, opts = {}, textSize = 22) {
   const { size = textSize, bold = false, align = 'left' } = opts
-  ctx.font = `${bold ? 'bold ' : ''}${size}px ${FONT_FAMILY}`
+  ctx.font = `${bold ? 'bold ' : ''}${size}px ${FONT_STACK}`
   ctx.fillStyle = '#000'
   ctx.textAlign = align
   const x = align === 'center' ? WIDTH / 2 : align === 'right' ? WIDTH - MARGIN : MARGIN
@@ -238,6 +450,7 @@ const MIN_RECEIPT_SCALE = 0.6
 // driven by the line-height increment, not the glyph size — so every
 // vertical measurement here (line height, gaps, margins) scales together.
 function layoutReceipt(data, logoDims, qrDims, scale) {
+  const cur = currencyFor(data)
   const sz = (px) => Math.round(px * scale)
   const lineHeight = sz(RECEIPT_LINE_HEIGHT)
   const textSize = sz(RECEIPT_TEXT_SIZE)
@@ -253,7 +466,7 @@ function layoutReceipt(data, logoDims, qrDims, scale) {
   if (logoDims) {
     const w = sz(logoDims.width)
     const h = sz(logoDims.height)
-    ops.push({ image: logo.image, x: (WIDTH - w) / 2, y, width: w, height: h })
+    ops.push({ image: logo.image, x: (WIDTH - w) / 2, y, width: w, height: h, dither: true })
     y += h + sz(LOGO_MARGIN_BOTTOM)
   }
 
@@ -262,10 +475,10 @@ function layoutReceipt(data, logoDims, qrDims, scale) {
     y += lineHeight + sz(6)
   }
 
-  ops.push({ y, text: `โต๊ะ ${data.tableNumber}`, opts: { size: sz(34), bold: true, align: 'center' } })
+  ops.push({ y, text: `${T.table} ${data.tableNumber}`, opts: { size: sz(34), bold: true, align: 'center' } })
   y += lineHeight + sz(6)
 
-  ops.push({ y, text: new Date().toLocaleString('lo-LA'), opts: { size: sz(18), align: 'center' } })
+  ops.push({ y, text: new Date().toLocaleString(T.dateLocale), opts: { size: sz(18), align: 'center' } })
   y += lineHeight
 
   ops.push({ divider: true, y })
@@ -273,21 +486,27 @@ function layoutReceipt(data, logoDims, qrDims, scale) {
 
   // Items
   for (const line of data.lines) {
-    ops.push({ y, text: `${line.quantity}x ${line.name}`, opts: { size: textSize, align: 'left' } })
-    ops.push({ y, text: line.lineTotal.toLocaleString(), opts: { size: textSize, align: 'right' } })
-    y += lineHeight
+    const price = amount(line.lineTotal, cur)
+    measureCtx.font = `${textSize}px ${FONT_STACK}`
+    const nameWidth = WIDTH - MARGIN * 2 - measureCtx.measureText(price).width - sz(16)
+    const nameLines = wrapText(`${line.quantity}x ${itemName(line)}`, nameWidth, textSize)
+    ops.push({ y, text: price, opts: { size: textSize, align: 'right' } })
+    for (const text of nameLines) {
+      ops.push({ y, text, opts: { size: textSize, align: 'left' } })
+      y += lineHeight
+    }
   }
 
   // Totals
   ops.push({ divider: true, y })
   y += dividerGap
-  ops.push({ y, text: 'รวมย่อย', opts: { size: textSize, align: 'left' } })
-  ops.push({ y, text: `฿${data.subtotal.toLocaleString()}`, opts: { size: textSize, align: 'right' } })
+  ops.push({ y, text: T.subtotal, opts: { size: textSize, align: 'left' } })
+  ops.push({ y, text: money(data.subtotal, cur), opts: { size: textSize, align: 'right' } })
   y += lineHeight
 
   if (data.serviceCharge > 0) {
-    ops.push({ y, text: 'ค่าบริการ', opts: { size: textSize, align: 'left' } })
-    ops.push({ y, text: `฿${data.serviceCharge.toLocaleString()}`, opts: { size: textSize, align: 'right' } })
+    ops.push({ y, text: T.serviceCharge, opts: { size: textSize, align: 'left' } })
+    ops.push({ y, text: money(data.serviceCharge, cur), opts: { size: textSize, align: 'right' } })
     y += lineHeight
   }
 
@@ -298,23 +517,23 @@ function layoutReceipt(data, logoDims, qrDims, scale) {
   if (data.isVip) {
     const label = data.vipChargeAmount > 0 ? `VIP Table (${data.vipDurationLabel})` : 'VIP Table Charge'
     ops.push({ y, text: label, opts: { size: textSize, align: 'left' } })
-    ops.push({ y, text: `฿${data.vipChargeAmount.toLocaleString()}`, opts: { size: textSize, align: 'right' } })
+    ops.push({ y, text: money(data.vipChargeAmount, cur), opts: { size: textSize, align: 'right' } })
     y += lineHeight
   }
 
   // Snapshotted onto the Bill at print time (see printBill/closeBillAndTable
   // in bill-actions.ts) — only present when a discount campaign was applied.
   if (data.discountAmount > 0) {
-    ops.push({ y, text: `ส่วนลด ${data.discountName} ${data.discountPercent}%`, opts: { size: textSize, align: 'left' } })
-    ops.push({ y, text: `-฿${data.discountAmount.toLocaleString()}`, opts: { size: textSize, align: 'right' } })
+    ops.push({ y, text: `${T.discount} ${data.discountName} ${data.discountPercent}%`, opts: { size: textSize, align: 'left' } })
+    ops.push({ y, text: `-${money(data.discountAmount, cur)}`, opts: { size: textSize, align: 'right' } })
     y += lineHeight - sz(8)
-    ops.push({ y, text: 'ไม่รวมเครื่องดื่ม', opts: { size: sz(16), align: 'left' } })
+    ops.push({ y, text: T.excludesDrinks, opts: { size: sz(16), align: 'left' } })
     y += lineHeight - sz(6)
   }
 
   // Total
-  ops.push({ y, text: 'รวมทั้งหมด', opts: { size: sz(28), bold: true, align: 'left' } })
-  ops.push({ y, text: `฿${data.total.toLocaleString()}`, opts: { size: sz(28), bold: true, align: 'right' } })
+  ops.push({ y, text: T.total, opts: { size: sz(28), bold: true, align: 'left' } })
+  ops.push({ y, text: money(data.total, cur), opts: { size: sz(28), bold: true, align: 'right' } })
   y += lineHeight + sz(14)
 
   // Payment — only present on the reprint fired after payment is confirmed
@@ -323,17 +542,17 @@ function layoutReceipt(data, logoDims, qrDims, scale) {
   if (data.received != null) {
     ops.push({ divider: true, y })
     y += dividerGap
-    ops.push({ y, text: 'รับเงิน', opts: { size: textSize, align: 'left' } })
-    ops.push({ y, text: `฿${data.received.toLocaleString()}`, opts: { size: textSize, align: 'right' } })
+    ops.push({ y, text: T.received, opts: { size: textSize, align: 'left' } })
+    ops.push({ y, text: money(data.received, cur), opts: { size: textSize, align: 'right' } })
     y += lineHeight
-    ops.push({ y, text: 'เงินทอน', opts: { size: textSize, align: 'left' } })
-    ops.push({ y, text: `฿${data.change.toLocaleString()}`, opts: { size: textSize, align: 'right' } })
+    ops.push({ y, text: T.change, opts: { size: textSize, align: 'left' } })
+    ops.push({ y, text: money(data.change, cur), opts: { size: textSize, align: 'right' } })
     y += lineHeight + sz(14)
   }
 
   // QR
   if (qrDims) {
-    ops.push({ y, text: 'สแกนเพื่อชำระเงิน', opts: { size: sz(20), align: 'center' } })
+    ops.push({ y, text: T.scanToPay, opts: { size: sz(20), align: 'center' } })
     y += lineHeight
     const w = sz(qrDims.width)
     const h = sz(qrDims.height)
@@ -341,7 +560,7 @@ function layoutReceipt(data, logoDims, qrDims, scale) {
     y += h + sz(QR_MARGIN_TOP)
   }
 
-  ops.push({ y, text: 'ขอบคุณที่ใช้บริการ', opts: { size: sz(20), align: 'center' } })
+  ops.push({ y, text: T.thankYou, opts: { size: sz(20), align: 'center' } })
   y += sz(8)
 
   return { ops, height: y + sz(20) }
@@ -363,8 +582,10 @@ function renderReceiptImage(data) {
   ctx.fillRect(0, 0, WIDTH, layout.height)
 
   for (const op of layout.ops) {
-    if (op.image) ctx.drawImage(op.image, op.x, op.y, op.width, op.height)
-    else if (op.divider) drawDivider(ctx, op.y)
+    if (op.image) {
+      const source = op.dither ? ditherToBlackWhite(op.image, op.width, op.height) : op.image
+      ctx.drawImage(source, op.x, op.y, op.width, op.height)
+    } else if (op.divider) drawDivider(ctx, op.y)
     else drawLine(ctx, op.y, op.text, op.opts)
   }
 
@@ -388,7 +609,7 @@ function renderKotImage(data) {
   // otherwise the bigger glyphs overlap the next line.
   const KOT_LINE_HEIGHT = 44
 
-  ops.push({ y, text: `โต๊ะ ${data.tableNumber}`, opts: { size: 38, bold: true, align: 'center' } })
+  ops.push({ y, text: `${T.table} ${data.tableNumber}`, opts: { size: 38, bold: true, align: 'center' } })
   y += KOT_LINE_HEIGHT + 4
 
   // stationLabel is the Lao display text (see lib/actions/print-jobs.ts's
@@ -401,18 +622,22 @@ function renderKotImage(data) {
     y += KOT_LINE_HEIGHT
   }
 
-  ops.push({ y, text: new Date().toLocaleString('lo-LA'), opts: { size: 18, align: 'center' } })
+  ops.push({ y, text: new Date().toLocaleString(T.dateLocale), opts: { size: 18, align: 'center' } })
   y += KOT_LINE_HEIGHT
 
   ops.push({ divider: true, y })
   y += 25
 
   for (const item of data.items) {
-    ops.push({ y, text: `${item.quantity}x ${item.name}`, opts: { size: 34, bold: true } })
-    y += KOT_LINE_HEIGHT
+    for (const text of wrapText(`${item.quantity}x ${itemName(item)}`, WIDTH - MARGIN * 2, 34, true)) {
+      ops.push({ y, text, opts: { size: 34, bold: true } })
+      y += KOT_LINE_HEIGHT
+    }
     if (item.note) {
-      ops.push({ y, text: `  * ${item.note}`, opts: { size: 24 } })
-      y += KOT_LINE_HEIGHT - 6
+      for (const text of wrapText(`  * ${item.note}`, WIDTH - MARGIN * 2, 24)) {
+        ops.push({ y, text, opts: { size: 24 } })
+        y += KOT_LINE_HEIGHT - 6
+      }
     }
   }
 
@@ -430,4 +655,89 @@ function renderKotImage(data) {
   return canvas.toBuffer('image/png')
 }
 
-module.exports = { renderReceiptImage, renderKotImage, logoReady, qrReady, syncBranding }
+// Per-session ordering QR slip (job type SESSION_QR — see the web app's
+// lib/table-session.ts enqueueSessionQrPrint): table number, the session's
+// order URL as a QR code, and when the table was opened. The QR is drawn
+// module-by-module as solid black squares rather than via the printer's own
+// ESC/POS QR command — many clone printers don't implement that command, and
+// drawing it keeps this slip on the same image path as every other job.
+const SESSION_QR_MODULE_DOTS = 10 // dots per QR module — ~1.25mm at 203dpi, easy for phone cameras
+const SESSION_QR_QUIET_MODULES = 4 // white border the QR spec requires around the code
+
+function renderSessionQrImage(data) {
+  const qr = QRCode.create(String(data.orderUrl), { errorCorrectionLevel: 'M' })
+  const modules = qr.modules.size
+  // Shrink modules for very long URLs so the code (plus quiet zone) still fits the paper.
+  const moduleDots = Math.max(
+    4,
+    Math.min(SESSION_QR_MODULE_DOTS, Math.floor((WIDTH - MARGIN * 2) / (modules + SESSION_QR_QUIET_MODULES * 2)))
+  )
+  const qrSize = modules * moduleDots
+
+  const ops = []
+  let y = 58
+  ops.push({ y, text: `${T.table} ${data.tableNumber}`, opts: { size: 44, bold: true, align: 'center' } })
+  y += 30
+  const qrTop = y + SESSION_QR_QUIET_MODULES * moduleDots
+  y = qrTop + qrSize + SESSION_QR_QUIET_MODULES * moduleDots + 34
+  ops.push({ y, text: T.scanToOrder, opts: { size: 32, bold: true, align: 'center' } })
+  y += 40
+  const opened = data.openedAt ? new Date(data.openedAt) : null
+  if (opened && !Number.isNaN(opened.getTime())) {
+    ops.push({ y, text: `${T.openedAt} ${opened.toLocaleString(T.dateLocale)}`, opts: { size: 20, align: 'center' } })
+    y += 30
+  }
+
+  const height = y + 20
+  const canvas = createCanvas(WIDTH, height)
+  const ctx = canvas.getContext('2d')
+  ctx.fillStyle = '#fff'
+  ctx.fillRect(0, 0, WIDTH, height)
+
+  const left = Math.round((WIDTH - qrSize) / 2)
+  ctx.fillStyle = '#000'
+  for (let row = 0; row < modules; row++) {
+    for (let col = 0; col < modules; col++) {
+      if (qr.modules.get(row, col)) ctx.fillRect(left + col * moduleDots, qrTop + row * moduleDots, moduleDots, moduleDots)
+    }
+  }
+  for (const op of ops) drawLine(ctx, op.y, op.text, op.opts)
+
+  return canvas.toBuffer('image/png')
+}
+
+// Short slip for a "Test print" sent from /admin/printers' found-printers
+// list (job type TEST) — prints the address it was sent to, so an admin
+// standing at a printer can tell which scanned address that printer is.
+function renderTestImage(data) {
+  const target = data.target || {}
+  const address = target.connectionType === 'USB' ? `USB ${target.comPort}` : `${target.ip}:${target.port}`
+  const lines = [
+    { text: T.printerTest, opts: { size: 36, bold: true, align: 'center' }, step: 52 },
+    { text: address, opts: { size: 40, bold: true, align: 'center' }, step: 48 },
+    { text: new Date().toLocaleString(T.dateLocale), opts: { size: 20, align: 'center' }, step: 30 },
+  ]
+  let y = 52
+  const ops = lines.map((l) => {
+    const op = { y, text: l.text, opts: l.opts }
+    y += l.step
+    return op
+  })
+  const height = y + 10
+  const canvas = createCanvas(WIDTH, height)
+  const ctx = canvas.getContext('2d')
+  ctx.fillStyle = '#fff'
+  ctx.fillRect(0, 0, WIDTH, height)
+  for (const op of ops) drawLine(ctx, op.y, op.text, op.opts)
+  return canvas.toBuffer('image/png')
+}
+
+module.exports = {
+  renderReceiptImage,
+  renderKotImage,
+  renderSessionQrImage,
+  renderTestImage,
+  logoReady,
+  qrReady,
+  syncBranding,
+}
