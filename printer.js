@@ -195,9 +195,22 @@ function isPrivateIPv4(ip) {
   const [a, b] = ip.split('.').map(Number)
   return a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168)
 }
+// A USB target is a COM port or — for a driver-installed printer — its Windows
+// printer name ("POS-80C"), the same two forms the web app's
+// sanitizeDevices() (lib/printer-discovery.ts) accepts. Anything COM<digits>
+// must be a valid COM port, as isSerialPort() routes those to \\.\COMx.
+const COM_PORT = /^COM[1-9]\d{0,2}$/i
+const PRINTER_NAME = /^[\p{L}\p{N}](?:[\p{L}\p{M}\p{N} _.()-]{0,78}[\p{L}\p{M}\p{N})])?$/u
+function parseUsbTarget(value) {
+  if (typeof value !== 'string') return null
+  const v = value.trim()
+  if (/^COM\d+$/i.test(v)) return COM_PORT.test(v) ? v.toUpperCase() : null
+  return PRINTER_NAME.test(v) ? v : null
+}
 function parseTestTarget(raw) {
-  if (raw && raw.connectionType === 'USB' && /^COM[1-9]\d{0,2}$/i.test(raw.comPort || '')) {
-    return { connectionType: 'USB', comPort: raw.comPort.toUpperCase() }
+  if (raw && raw.connectionType === 'USB') {
+    const comPort = parseUsbTarget(raw.comPort)
+    return comPort ? { connectionType: 'USB', comPort } : null
   }
   const port = Number(raw && raw.port)
   if (
