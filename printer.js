@@ -4,6 +4,7 @@ const fs = require('fs')
 const os = require('os')
 const path = require('path')
 const { syncBranding } = require('./render')
+const { spoolerInterface } = require('./spooler')
 
 const API_URL = process.env.API_URL
 const AGENT_SECRET = process.env.AGENT_SECRET
@@ -68,16 +69,24 @@ async function refreshPrinterConfig() {
 refreshPrinterConfig()
 setInterval(refreshPrinterConfig, 60_000)
 
+// A USB target's comPort is either a serial port (COM3) or, for a printer
+// installed with a Windows driver, its printer name (POS-80C) / spooler port
+// (USB001) — those aren't device files and can only be reached via the spooler.
+function isSerialPort(name) {
+  return /^COM\d+$/i.test(name)
+}
+
+function usbInterface(comPort) {
+  // Serial: node-thermal-printer falls through to its File interface for any
+  // string that isn't tcp://... or printer:..., so a raw Windows device
+  // path (\\.\COM3) is written to directly — no native driver needed.
+  return isSerialPort(comPort) ? `\\\\.\\${comPort}` : spoolerInterface(comPort)
+}
+
 function createPrinterForTarget(target) {
   return new ThermalPrinter({
     type: PrinterTypes.EPSON,
-    // USB: node-thermal-printer falls through to its File interface for any
-    // string that isn't tcp://... or printer:..., so a raw Windows device
-    // path (\\.\COM3) is written to directly — no native driver needed.
-    interface:
-      target.connectionType === 'USB'
-        ? `\\\\.\\${target.comPort}`
-        : `tcp://${target.ip}:${target.port}`,
+    interface: target.connectionType === 'USB' ? usbInterface(target.comPort) : `tcp://${target.ip}:${target.port}`,
     options: { timeout: 5000 },
   })
 }
