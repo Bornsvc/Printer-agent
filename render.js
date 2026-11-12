@@ -550,6 +550,25 @@ function layoutReceipt(data, logoDims, qrDims, scale) {
     y += lineHeight + sz(14)
   }
 
+  // Total in every currency the shop quotes (LAK / THB / USD), converted by
+  // the main app from the exchange rates in /admin/settings and sent as
+  // `currencyTotals`. Absent when no rates are set, so older/unconfigured
+  // jobs print exactly as before. Entries with an unknown currency are
+  // skipped rather than trusted.
+  const currencyTotals = Array.isArray(data.currencyTotals)
+    ? data.currencyTotals.filter((c) => c && Object.hasOwn(CURRENCIES, c.currency) && Number.isFinite(Number(c.amount)))
+    : []
+  if (currencyTotals.length > 0) {
+    ops.push({ divider: true, y })
+    y += dividerGap
+    for (const c of currencyTotals) {
+      ops.push({ y, text: c.currency, opts: { size: textSize, bold: true, align: 'left' } })
+      ops.push({ y, text: money(c.amount, CURRENCIES[c.currency]), opts: { size: textSize, bold: true, align: 'right' } })
+      y += lineHeight
+    }
+    y += sz(14)
+  }
+
   // QR
   if (qrDims) {
     ops.push({ y, text: T.scanToPay, opts: { size: sz(20), align: 'center' } })
