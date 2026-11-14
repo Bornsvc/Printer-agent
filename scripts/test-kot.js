@@ -41,32 +41,42 @@ const sample = {
 
   station,
 
+  // Optional fields sent by newer web app versions (header + price line).
+  restaurantName: 'KVVATM',
+  currency: 'LAK',
+
   items: [
     {
       quantity: 2,
       name: 'ตำหลวงพระบาง',
+      price: 90000,
       note: 'เผ็ดน้อย',
     },
     {
       quantity: 1,
       name: 'คอหมูย่าง',
+      price: 65000,
     },
     {
       quantity: 1,
       name: 'ยำเล็บมือนาง',
+      price: 75000,
       note: 'ไม่ใส่ผักชี',
     },
     {
       quantity: 2,
       name: 'เอ็นไก่ทอด',
+      price: 50000,
     },
     {
       quantity: 1,
       name: 'เฟรนช์ฟรายส์หมาล่า',
+      price: 45000,
     },
     {
       quantity: 2,
       name: 'ข้าวเหนียว',
+      price: 20000,
     },
   ],
 }

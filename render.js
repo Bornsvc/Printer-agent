@@ -807,6 +807,51 @@ function renderReceiptImage(data) {
   return [canvas.toBuffer('image/png')]
 }
 
+// Currency *code* for the kitchen slip's price line ("65,000 LAK") — same
+// precedence as currencyFor(): PRINT_CURRENCY, then the job's own currency, THB.
+function currencyCodeFor(data) {
+  if (CURRENCIES[PRINT_CURRENCY]) return PRINT_CURRENCY
+  return CURRENCIES[data.currency] ? data.currency : 'THB'
+}
+
+// "13/11/26 | 12:01" in Laos/Thailand time, regardless of this machine's zone.
+function kotStamp(date = new Date()) {
+  const p = Object.fromEntries(
+    new Intl.DateTimeFormat('en-GB', {
+      timeZone: RECEIPT_TZ,
+      hourCycle: 'h23',
+      year: '2-digit',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+    })
+      .formatToParts(date)
+      .map((part) => [part.type, part.value])
+  )
+  return `${p.day}/${p.month}/${p.year} | ${p.hour}:${p.minute}`
+}
+
+// Largest font size (down to `min`) at which `text` fits in `maxWidth`.
+function fitFontSize(text, maxWidth, size, min, bold = false) {
+  for (let s = size; s > min; s -= 2) {
+    measureCtx.font = `${bold ? 'bold ' : ''}${s}px ${FONT_STACK}`
+    if (measureCtx.measureText(text).width <= maxWidth) return s
+  }
+  return min
+}
+
+// Kitchen slip (one item per job — see the web app's enqueueOrderKot):
+//
+//   [ B2 ██████████ ]  Restaurant name      table, inverted, + restaurant
+//   Item name (qty)                          bold, wraps
+//   * note                                   only when the customer wrote one
+//   ລວມ 65,000 LAK                           line total, when the job carries a price
+//   - - - - - - - - - - - - - - - - - -
+//   ຄົວຮ້ອນ                13/11/26 | 12:01   station (small) + print time
+//
+// Optional payload fields (`restaurantName`, `currency`, items[].price) come
+// from newer web app versions; without them those parts are simply omitted.
 function renderKotImage(data) {
   // Height must match content exactly — a flat per-item line-count estimate
   // (e.g. always reserving a note line) leaves blank paper at the bottom of
@@ -815,52 +860,115 @@ function renderKotImage(data) {
   // positions recorded in `ops` — the two passes can't drift apart since the
   // draw pass never recomputes a position, only replays what the dry pass logged.
   const ops = []
-  let y = 36
-  // Kitchen slips are read at a glance from across the pass, so KOT text runs
-  // noticeably larger than receipt text — with a taller line height to match,
-  // otherwise the bigger glyphs overlap the next line.
+  const BAR_TOP = 20
+  const BAR_PAD = 14
+  const TABLE_SIZE = 40
+  const TABLE_MIN_SIZE = 24
+  const NAME_GAP = 16
+  const NAME_MIN_ROOM = 150 // beside the box; narrower than this → name goes under it
+  const ITEM_SIZE = 36
   const KOT_LINE_HEIGHT = 44
+  const innerWidth = WIDTH - MARGIN * 2
+  const textRoom = innerWidth - BAR_PAD * 2
 
-  ops.push({ y, text: `${T.table} ${data.tableNumber}`, opts: { size: 38, bold: true, align: 'center' } })
-  y += KOT_LINE_HEIGHT + 4
+  // Inverted table box. Table names are free text, so the label is shrunk to
+  // fit the full width and, past the minimum size, wrapped onto more lines (the
+  // box grows) — the table is the one field that must never be cut off.
+  const tableText = String(data.tableNumber ?? '')
+  const tableSize = fitFontSize(tableText, textRoom, TABLE_SIZE, TABLE_MIN_SIZE, true)
+  const tableLines = wrapText(tableText, textRoom, tableSize, true)
+  const TABLE_LINE_HEIGHT = Math.round(tableSize * 1.25)
+  const barHeight =
+    tableLines.length === 1 ? 58 : tableLines.length * TABLE_LINE_HEIGHT + 14
+  measureCtx.font = `bold ${tableSize}px ${FONT_STACK}`
+  const widest = Math.max(...tableLines.map((l) => measureCtx.measureText(l).width))
+  // At least half the paper wide (matches the sample), wider for a long label.
+  const barWidth = Math.min(innerWidth, Math.max(innerWidth * 0.5, widest + BAR_PAD * 2))
+  const barBottom = BAR_TOP + barHeight
+  ops.push({
+    draw: (ctx) => {
+      ctx.fillStyle = '#000'
+      ctx.fillRect(MARGIN, BAR_TOP, barWidth, barHeight)
+      ctx.fillStyle = '#fff'
+      ctx.font = `bold ${tableSize}px ${FONT_STACK}`
+      ctx.textAlign = 'left'
+      const first = tableLines.length === 1 ? barBottom - 14 : BAR_TOP + TABLE_LINE_HEIGHT
+      tableLines.forEach((line, i) => ctx.fillText(line, MARGIN + BAR_PAD, first + i * TABLE_LINE_HEIGHT))
+    },
+  })
 
-  // stationLabel is the Lao display text (see lib/actions/print-jobs.ts's
-  // enqueueOrderKot); `station` is only the routing key (e.g. "HOT_KITCHEN")
-  // and falls back here only for scripts/test-kot.js's manual sample data,
-  // which sets station but no stationLabel.
-  const stationHeader = data.stationLabel || data.station
-  if (stationHeader) {
-    ops.push({ y, text: stationHeader, opts: { size: 26, align: 'center' } })
-    y += KOT_LINE_HEIGHT
+  // Restaurant name: beside the box when there's room, otherwise on its own
+  // line under it.
+  let y = barBottom + 46
+  const restaurant = typeof data.restaurantName === 'string' ? data.restaurantName.trim() : ''
+  if (restaurant) {
+    const besideX = MARGIN + barWidth + NAME_GAP
+    const beside = WIDTH - MARGIN - besideX >= NAME_MIN_ROOM
+    const nameX = beside ? besideX : MARGIN
+    const nameWidth = WIDTH - MARGIN - nameX
+    // Shrink to fit, but never below a readable size — past that, cut with "…".
+    const nameSize = fitFontSize(restaurant, nameWidth, 30, 20, true)
+    measureCtx.font = `bold ${nameSize}px ${FONT_STACK}`
+    let nameText = restaurant
+    if (measureCtx.measureText(nameText).width > nameWidth) {
+      const chars = Array.from(graphemeSegmenter.segment(restaurant), (g) => g.segment)
+      while (chars.length > 1 && measureCtx.measureText(chars.join('') + '…').width > nameWidth) chars.pop()
+      nameText = chars.join('') + '…'
+    }
+    if (beside) {
+      ops.push({ y: barBottom - 14, text: nameText, opts: { size: nameSize, bold: true, x: nameX } })
+    } else {
+      ops.push({ y: barBottom + 36, text: nameText, opts: { size: nameSize, bold: true, x: nameX } })
+      y += 40
+    }
   }
 
-  ops.push({ y, text: new Date().toLocaleString(T.dateLocale), opts: { size: 18, align: 'center' } })
-  y += KOT_LINE_HEIGHT
-
-  ops.push({ divider: true, y })
-  y += 25
-
+  const cur = currencyFor(data)
+  const code = currencyCodeFor(data)
   for (const item of data.items) {
-    for (const text of wrapText(`${item.quantity}x ${itemName(item)}`, WIDTH - MARGIN * 2, 34, true)) {
-      ops.push({ y, text, opts: { size: 34, bold: true } })
+    // Quantity stays glued to the end of the name's last line; if it doesn't
+    // fit there it moves down whole (never split as "(" / "12)").
+    const nameLines = wrapText(itemName(item), innerWidth, ITEM_SIZE, true)
+    const qty = `(${item.quantity})`
+    measureCtx.font = `bold ${ITEM_SIZE}px ${FONT_STACK}`
+    const withQty = `${nameLines[nameLines.length - 1]} ${qty}`
+    if (measureCtx.measureText(withQty).width <= innerWidth) nameLines[nameLines.length - 1] = withQty
+    else nameLines.push(qty)
+    for (const text of nameLines) {
+      ops.push({ y, text, opts: { size: ITEM_SIZE, bold: true } })
       y += KOT_LINE_HEIGHT
     }
     if (item.note) {
-      for (const text of wrapText(`  * ${item.note}`, WIDTH - MARGIN * 2, 24)) {
-        ops.push({ y, text, opts: { size: 24 } })
+      for (const text of wrapText(`  * ${item.note}`, innerWidth, 26)) {
+        ops.push({ y, text, opts: { size: 26 } })
         y += KOT_LINE_HEIGHT - 6
       }
     }
+    if (typeof item.price === 'number' && Number.isFinite(item.price)) {
+      ops.push({ y, text: `${T.itemAmount} ${amount(item.price, cur)} ${code}`, opts: { size: 28 } })
+      y += KOT_LINE_HEIGHT - 4
+    }
+    y += 6
   }
 
-  const height = y + 20
+  y += 8
+  ops.push({ divider: true, dashed: true, y })
+  y += 34
+
+  // Station (small, left) shares the footer row with the print time (right).
+  const stationHeader = data.stationLabel || data.station
+  if (stationHeader) ops.push({ y, text: stationHeader, opts: { size: 22 } })
+  ops.push({ y, text: kotStamp(), opts: { size: 24, align: 'right' } })
+
+  const height = y + 24
   const canvas = createCanvas(WIDTH, height)
   const ctx = canvas.getContext('2d')
   ctx.fillStyle = '#fff'
   ctx.fillRect(0, 0, WIDTH, height)
 
   for (const op of ops) {
-    if (op.divider) drawDivider(ctx, op.y)
+    if (op.draw) op.draw(ctx)
+    else if (op.divider) drawDivider(ctx, op.y, op.dashed)
     else drawLine(ctx, op.y, op.text, op.opts, 70)
   }
 
