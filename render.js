@@ -74,6 +74,7 @@ const LABELS = {
     itemQty: 'จำนวน',
     itemPrice: 'ราคา',
     itemAmount: 'รวม',
+    billNumber: 'เลขที่บิล',
     billCode: 'รหัสบิล',
     date: 'วันที่',
     time: 'เวลา',
@@ -100,6 +101,7 @@ const LABELS = {
     itemQty: 'Qty',
     itemPrice: 'Price',
     itemAmount: 'Amount',
+    billNumber: 'Bill no.',
     billCode: 'Bill code',
     date: 'Date',
     time: 'Time',
@@ -126,6 +128,7 @@ const LABELS = {
     itemQty: 'ຈຳນວນ',
     itemPrice: 'ລາຄາ',
     itemAmount: 'ລວມ',
+    billNumber: 'ເລກທີ່ບິນ',
     billCode: 'ລະຫັດບິນ',
     date: 'ວັນທີ',
     time: 'ເວລາ',
@@ -587,6 +590,12 @@ function layoutReceipt(data, logoDims, qrDims, scale) {
     const value = nonEmptyString(row && row.value)
     if (value) infoRow(nonEmptyString(row.label), value)
   }
+
+  // Running number per day (1, 2, 3 …) from the web app, assigned on the bill's
+  // first print and the same on every reprint. Absent for older app versions and
+  // for bills that predate the numbering — then the row is simply left out.
+  const billNumber = Number.isInteger(data.billNumber) && data.billNumber > 0 ? data.billNumber : null
+  if (billNumber) infoRow(T.billNumber, String(billNumber))
 
   const billCode = nonEmptyString(data.billCode)
   if (billCode) infoRow(T.billCode, billCode)
