@@ -74,6 +74,8 @@ const LABELS = {
     itemQty: 'จำนวน',
     itemPrice: 'ราคา',
     itemAmount: 'รวม',
+    billNumber: 'เลขที่บิล',
+    reprint: 'พิมพ์ซ้ำ',
     billCode: 'รหัสบิล',
     date: 'วันที่',
     time: 'เวลา',
@@ -100,6 +102,8 @@ const LABELS = {
     itemQty: 'Qty',
     itemPrice: 'Price',
     itemAmount: 'Amount',
+    billNumber: 'Bill no.',
+    reprint: 'REPRINT',
     billCode: 'Bill code',
     date: 'Date',
     time: 'Time',
@@ -126,6 +130,8 @@ const LABELS = {
     itemQty: 'ຈຳນວນ',
     itemPrice: 'ລາຄາ',
     itemAmount: 'ລວມ',
+    billNumber: 'ເລກທີ່ບິນ',
+    reprint: 'ພິມຊ້ຳ',
     billCode: 'ລະຫັດບິນ',
     date: 'ວັນທີ',
     time: 'ເວລາ',
@@ -588,6 +594,12 @@ function layoutReceipt(data, logoDims, qrDims, scale) {
     if (value) infoRow(nonEmptyString(row.label), value)
   }
 
+  // Running number per day (1, 2, 3 …) from the web app, assigned on the bill's
+  // first print and the same on every reprint. Absent for older app versions and
+  // for bills that predate the numbering — then the row is simply left out.
+  const billNumber = Number.isInteger(data.billNumber) && data.billNumber > 0 ? data.billNumber : null
+  if (billNumber) infoRow(T.billNumber, String(billNumber))
+
   const billCode = nonEmptyString(data.billCode)
   if (billCode) infoRow(T.billCode, billCode)
 
@@ -860,7 +872,26 @@ function renderKotImage(data) {
   // positions recorded in `ops` — the two passes can't drift apart since the
   // draw pass never recomputes a position, only replays what the dry pass logged.
   const ops = []
-  const BAR_TOP = 20
+  // A ticket the web app re-queued by hand (`reprint: true`, set when an admin
+  // reprints a failed/unsure/expired ticket) gets a banner on top, so the kitchen
+  // can tell it from a new order and doesn't cook the dish twice. Shows when the
+  // original was created, if known.
+  let bannerHeight = 0
+  if (data.reprint === true) {
+    ops.push({
+      y: 20 + 30,
+      text: `*** ${T.reprint} ***`,
+      opts: { size: 32, bold: true, align: 'center' },
+    })
+    bannerHeight = 42
+    const original = data.originalCreatedAt ? new Date(data.originalCreatedAt) : null
+    if (original && !Number.isNaN(original.getTime())) {
+      ops.push({ y: 20 + 30 + 30, text: kotStamp(original), opts: { size: 24, align: 'center' } })
+      bannerHeight += 30
+    }
+    bannerHeight += 8
+  }
+  const BAR_TOP = 20 + bannerHeight
   const BAR_PAD = 14
   const TABLE_SIZE = 40
   const TABLE_MIN_SIZE = 24

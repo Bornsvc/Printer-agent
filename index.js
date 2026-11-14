@@ -120,6 +120,9 @@ function runOnPrinterQueue(queueKey, label, fn) {
 // themselves. TEST jobs have no station (see queueTargetFor).
 function stationKeyFor(job, payload) {
   if (job.type === 'KOT') return payload.station
+  // A buzzer job names its printer (the web app's "Test beep" can target a
+  // kitchen station); the per-order "new order" cue has none → the bill printer.
+  if (job.type === 'BEEP' && payload.station) return payload.station
   return 'RECEIPT'
 }
 
@@ -179,7 +182,7 @@ async function handleJob(job) {
       } else if (job.type === 'BEEP') {
         // "New order" cue for the bill printer — one attempt, no retry: the job
         // expires within a minute server-side and a late beep is just noise.
-        await alertBeep('RECEIPT')
+        await alertBeep(payload.station || 'RECEIPT', { force: payload.test === true })
       } else if (job.type === 'SESSION_QR') {
         // Per-session ordering QR slip (web app: lib/table-session.ts).
         const image = renderSessionQrImage(payload)
