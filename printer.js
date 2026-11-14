@@ -34,9 +34,44 @@ const BEEP_STATIONS = new Set(
     .filter(Boolean)
 )
 
+// Beep settings saved on the web app's /admin/settings (delivered with the
+// printer config, refreshed every 60 s). When present they REPLACE the .env
+// values above; null (never set there, or an older/invalid value) = keep using
+// .env, so an existing install behaves exactly as before until an admin saves.
+// Shape: { enabled, stations: string[], times: 1-9, length: 1-9 }.
+let serverBeep = null
+
+function parseServerBeep(value) {
+  if (!value || typeof value !== 'object') return null
+  const inRange = (n) => Number.isInteger(n) && n >= 1 && n <= 9
+  if (typeof value.enabled !== 'boolean' || !Array.isArray(value.stations)) return null
+  if (!inRange(value.times) || !inRange(value.length)) return null
+  return {
+    enabled: value.enabled,
+    stations: new Set(value.stations.map((s) => String(s).trim().toUpperCase()).filter(Boolean)),
+    times: value.times,
+    length: value.length,
+  }
+}
+
+function describeBeep(beep) {
+  if (!beep) return 'using .env'
+  const stations = [...beep.stations].join(',') || 'no stations'
+  return `${beep.enabled ? 'on' : 'off'} · ${stations} · ${beep.times}x${beep.length} (from web app)`
+}
+
+function beepTimes() {
+  return serverBeep ? serverBeep.times : BEEP_TIMES
+}
+function beepLength() {
+  return serverBeep ? serverBeep.length : BEEP_LENGTH
+}
+
 function shouldBeep(station) {
+  const key = String(station).toUpperCase()
+  if (serverBeep) return serverBeep.enabled && serverBeep.stations.has(key)
   if (BEEP_STATIONS.has('NONE')) return false
-  return BEEP_STATIONS.has('ALL') || BEEP_STATIONS.has(String(station).toUpperCase())
+  return BEEP_STATIONS.has('ALL') || BEEP_STATIONS.has(key)
 }
 
 // Kitchen tickets print one per ITEM, so an order of 10 dishes would beep 10
@@ -120,6 +155,13 @@ async function refreshPrinterConfig() {
     }
     printerCache = next
     console.log('🔄 Printer config refreshed:', Object.keys(printerCache).join(', '))
+
+    // Beep settings from the web app (additive field — older servers omit it).
+    const beep = parseServerBeep(data.beep)
+    const before = describeBeep(serverBeep)
+    const after = describeBeep(beep)
+    if (after !== before) console.log('🔔 Beep settings:', after)
+    serverBeep = beep
 
     const branding = await syncBranding({ logoUrl: data.logoUrl, paymentQrUrl: data.paymentQrUrl })
     if (branding.logoChanged || branding.qrChanged) {
@@ -243,7 +285,7 @@ async function printImageToTarget(target, imageBuffer, label, { beep = false } =
     printer.cut()
     // Queued into the same command buffer as printImage/cut above — one
     // execute() flushes all of them together.
-    if (beep) printer.beep(BEEP_TIMES, BEEP_LENGTH)
+    if (beep) printer.beep(beepTimes(), beepLength())
     await printer.execute()
   } catch (err) {
     throw new Error(`Print failed for ${label} (${describeTarget(target)}): ${err.message}`)
@@ -318,10 +360,13 @@ async function printKotImage(station, imageBuffer, orderId) {
 }
 
 // Buzzer-only cue (job type BEEP) — "a new order came in" on the bill printer,
-// with no paper. Honours BEEP_STATIONS like every other beep (NONE, or a list
-// without this station, makes it a silent no-op so the job still completes).
-async function alertBeep(station = 'RECEIPT') {
-  if (!shouldBeep(station)) return
+// with no paper. Honours the beep settings like every other beep (switched off,
+// or a list without this station, makes it a silent no-op so the job still
+// completes).
+// `force` (an admin's "Test beep" on /admin/settings) beeps regardless of the
+// stations list / master switch — the point is to hear whether the printer can.
+async function alertBeep(station = 'RECEIPT', { force = false } = {}) {
+  if (!force && !shouldBeep(station)) return
   await testBeep(station)
 }
 
@@ -355,7 +400,7 @@ async function testBeep(station = 'RECEIPT') {
 
   try {
     const printer = createPrinterForTarget(target)
-    printer.beep(BEEP_TIMES, BEEP_LENGTH)
+    printer.beep(beepTimes(), beepLength())
     await printer.execute()
   } catch (err) {
     throw new Error(`Beep failed for ${station} (${describeTarget(target)}): ${err.message}`)
