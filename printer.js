@@ -39,6 +39,44 @@ function shouldBeep(station) {
   return BEEP_STATIONS.has('ALL') || BEEP_STATIONS.has(String(station).toUpperCase())
 }
 
+// Kitchen tickets print one per ITEM, so an order of 10 dishes would beep 10
+// times (3 beeps each). A kitchen printer therefore beeps once per ORDER: the
+// first ticket of an order beeps, the rest of that order's tickets stay silent.
+// The web app tags each KOT with its `orderId`; for a ticket without one (an
+// older web app) the fallback is a cooldown — no second beep from the same
+// station within BEEP_COOLDOWN_SECONDS (default 8).
+const BEEP_COOLDOWN_MS = (() => {
+  const text = (process.env.BEEP_COOLDOWN_SECONDS ?? '').trim()
+  // Blank = use the default (like beepSetting); Number('') would be 0, which
+  // would silently switch the cooldown off.
+  const raw = text === '' ? NaN : Number(text)
+  return Number.isFinite(raw) && raw >= 0 ? raw * 1000 : 8000
+})()
+const lastBeepByStation = new Map() // station -> { orderId, at }
+
+// Decides whether THIS kitchen ticket should beep and, if so, records it. The
+// returned `undo` puts the previous state back — used when the print then
+// fails, so the order's next attempt is not wrongly silenced.
+function claimKotBeep(station, orderId) {
+  if (!shouldBeep(station)) return { beep: false, undo() {} }
+  const previous = lastBeepByStation.get(station)
+  const now = Date.now()
+  const duplicate = previous
+    ? orderId
+      ? previous.orderId === orderId
+      : now - previous.at < BEEP_COOLDOWN_MS
+    : false
+  if (duplicate) return { beep: false, undo() {} }
+  lastBeepByStation.set(station, { orderId: orderId || null, at: now })
+  return {
+    beep: true,
+    undo() {
+      if (previous) lastBeepByStation.set(station, previous)
+      else lastBeepByStation.delete(station)
+    },
+  }
+}
+
 // In-memory cache of printer IPs, refreshed periodically so admin changes
 // (made via /admin/printers) take effect without restarting the agent.
 let printerCache = {}
@@ -171,7 +209,7 @@ ready.then(() => {
   setInterval(checkAllPrinters, HEALTH_CHECK_INTERVAL_MS)
 })
 
-async function printImageBufferToStation(station, imageBuffer) {
+async function printImageBufferToStation(station, imageBuffer, { beep } = {}) {
   const target = printerCache[station]
   if (!target) {
     throw new Error(`ບໍ່ໄດ້ຕັ້ງຄ່າ IP ໃຫ້ ${station} — ໄປຕັ້ງໃນ /admin/printers`)
@@ -187,7 +225,7 @@ async function printImageBufferToStation(station, imageBuffer) {
   // either way (see index.js's PRINT_GAP_MS comment). Run
   // `node scripts/test-beep.js <STATION>` against a station's printer
   // before adding it to BEEP_STATIONS.
-  await printImageToTarget(target, imageBuffer, station, { beep: shouldBeep(station) })
+  await printImageToTarget(target, imageBuffer, station, { beep: beep ?? shouldBeep(station) })
 }
 
 // Prints one PNG to an explicit printer target and cuts. Station jobs go
@@ -269,8 +307,22 @@ async function printReceiptImage(pages) {
   }
 }
 
-async function printKotImage(station, imageBuffer) {
-  await printImageBufferToStation(station, imageBuffer)
+async function printKotImage(station, imageBuffer, orderId) {
+  const claim = claimKotBeep(station, orderId)
+  try {
+    await printImageBufferToStation(station, imageBuffer, { beep: claim.beep })
+  } catch (err) {
+    claim.undo()
+    throw err
+  }
+}
+
+// Buzzer-only cue (job type BEEP) — "a new order came in" on the bill printer,
+// with no paper. Honours BEEP_STATIONS like every other beep (NONE, or a list
+// without this station, makes it a silent no-op so the job still completes).
+async function alertBeep(station = 'RECEIPT') {
+  if (!shouldBeep(station)) return
+  await testBeep(station)
 }
 
 // The cash drawer is wired to the RECEIPT printer's drawer-kick (DK) port —
@@ -328,6 +380,7 @@ module.exports = {
   parseTestTarget,
   openCashDrawer,
   testBeep,
+  alertBeep,
   ready,
   getPrinterTarget,
 }

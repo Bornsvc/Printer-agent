@@ -15,6 +15,7 @@ const {
   printImageToTarget,
   parseTestTarget,
   openCashDrawer,
+  alertBeep,
   ready,
   getPrinterTarget,
 } = require('./printer')
@@ -169,9 +170,16 @@ async function handleJob(job) {
         await retryPrintAction(() => printReceiptImage(image), `Receipt print for job ${job.id}`)
       } else if (job.type === 'KOT') {
         const image = renderKotImage(payload)
-        await retryPrintAction(() => printKotImage(payload.station, image), `KOT print for job ${job.id}`)
+        await retryPrintAction(
+          () => printKotImage(payload.station, image, payload.orderId),
+          `KOT print for job ${job.id}`
+        )
       } else if (job.type === 'DRAWER') {
         await openCashDrawer()
+      } else if (job.type === 'BEEP') {
+        // "New order" cue for the bill printer — one attempt, no retry: the job
+        // expires within a minute server-side and a late beep is just noise.
+        await alertBeep('RECEIPT')
       } else if (job.type === 'SESSION_QR') {
         // Per-session ordering QR slip (web app: lib/table-session.ts).
         const image = renderSessionQrImage(payload)
