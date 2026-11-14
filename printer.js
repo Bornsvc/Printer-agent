@@ -4,9 +4,40 @@ const fs = require('fs')
 const os = require('os')
 const path = require('path')
 const { syncBranding } = require('./render')
+const { spoolerInterface } = require('./spooler')
 
 const API_URL = process.env.API_URL
 const AGENT_SECRET = process.env.AGENT_SECRET
+
+// Buzzer after each print (ESC B n t). ESC/POS has no volume setting — the
+// buzzer's loudness is fixed by the hardware — so "louder" here means more
+// and longer beeps. BEEP_TIMES = how many beeps, BEEP_LENGTH = how long each
+// one is (both 1–9, printer-defined units, roughly 50–100ms per step).
+// BEEP_STATIONS = which stations beep: a comma-separated list such as
+// "RECEIPT,HOT_KITCHEN", "ALL" for every station, or "NONE" to switch it off.
+// Defaults to RECEIPT only — see printImageBufferToStation for why a kitchen
+// station should be tested with scripts/test-beep.js before it's added.
+function beepSetting(name, fallback) {
+  const raw = process.env[name]
+  if (raw === undefined || raw.trim() === '') return fallback
+  const n = Number(raw)
+  if (Number.isInteger(n) && n >= 1 && n <= 9) return n
+  console.warn(`⚠️  ${name}="${raw}" must be a whole number from 1 to 9 — using ${fallback}.`)
+  return fallback
+}
+const BEEP_TIMES = beepSetting('BEEP_TIMES', 3)
+const BEEP_LENGTH = beepSetting('BEEP_LENGTH', 3)
+const BEEP_STATIONS = new Set(
+  (process.env.BEEP_STATIONS || 'RECEIPT')
+    .split(',')
+    .map((s) => s.trim().toUpperCase())
+    .filter(Boolean)
+)
+
+function shouldBeep(station) {
+  if (BEEP_STATIONS.has('NONE')) return false
+  return BEEP_STATIONS.has('ALL') || BEEP_STATIONS.has(String(station).toUpperCase())
+}
 
 // In-memory cache of printer IPs, refreshed periodically so admin changes
 // (made via /admin/printers) take effect without restarting the agent.
@@ -68,16 +99,24 @@ async function refreshPrinterConfig() {
 refreshPrinterConfig()
 setInterval(refreshPrinterConfig, 60_000)
 
+// A USB target's comPort is either a serial port (COM3) or, for a printer
+// installed with a Windows driver, its printer name (POS-80C) / spooler port
+// (USB001) — those aren't device files and can only be reached via the spooler.
+function isSerialPort(name) {
+  return /^COM\d+$/i.test(name)
+}
+
+function usbInterface(comPort) {
+  // Serial: node-thermal-printer falls through to its File interface for any
+  // string that isn't tcp://... or printer:..., so a raw Windows device
+  // path (\\.\COM3) is written to directly — no native driver needed.
+  return isSerialPort(comPort) ? `\\\\.\\${comPort}` : spoolerInterface(comPort)
+}
+
 function createPrinterForTarget(target) {
   return new ThermalPrinter({
     type: PrinterTypes.EPSON,
-    // USB: node-thermal-printer falls through to its File interface for any
-    // string that isn't tcp://... or printer:..., so a raw Windows device
-    // path (\\.\COM3) is written to directly — no native driver needed.
-    interface:
-      target.connectionType === 'USB'
-        ? `\\\\.\\${target.comPort}`
-        : `tcp://${target.ip}:${target.port}`,
+    interface: target.connectionType === 'USB' ? usbInterface(target.comPort) : `tcp://${target.ip}:${target.port}`,
     options: { timeout: 5000 },
   })
 }
@@ -140,15 +179,15 @@ async function printImageBufferToStation(station, imageBuffer) {
   // Audible cue that a job actually finished, since staff aren't always
   // standing right at the printer to see paper come out.
   //
-  // RECEIPT-only on purpose: scripts/test-beep.js has only ever confirmed
-  // this ESC/POS command against the RECEIPT printer. On an unverified
-  // model (the kitchen stations, still various clone units) a rejected or
-  // misinterpreted buzzer command can stall the printer's command
-  // processor mid-buffer and drop the job — invisibly, since execute()
-  // still resolves once the bytes are handed to the OS socket either way
-  // (see index.js's PRINT_GAP_MS comment). Enable per-station once that
-  // station's printer has been beep-tested the same way.
-  await printImageToTarget(target, imageBuffer, station, { beep: station === 'RECEIPT' })
+  // Only the stations listed in BEEP_STATIONS (default: RECEIPT). On an
+  // unverified model (the kitchen stations, still various clone units) a
+  // rejected or misinterpreted buzzer command can stall the printer's
+  // command processor mid-buffer and drop the job — invisibly, since
+  // execute() still resolves once the bytes are handed to the OS socket
+  // either way (see index.js's PRINT_GAP_MS comment). Run
+  // `node scripts/test-beep.js <STATION>` against a station's printer
+  // before adding it to BEEP_STATIONS.
+  await printImageToTarget(target, imageBuffer, station, { beep: shouldBeep(station) })
 }
 
 // Prints one PNG to an explicit printer target and cuts. Station jobs go
@@ -166,7 +205,7 @@ async function printImageToTarget(target, imageBuffer, label, { beep = false } =
     printer.cut()
     // Queued into the same command buffer as printImage/cut above — one
     // execute() flushes all of them together.
-    if (beep) printer.beep()
+    if (beep) printer.beep(BEEP_TIMES, BEEP_LENGTH)
     await printer.execute()
   } catch (err) {
     throw new Error(`Print failed for ${label} (${describeTarget(target)}): ${err.message}`)
@@ -254,19 +293,20 @@ async function openCashDrawer() {
 // Isolated buzzer test (see scripts/test-beep.js) — same ESC/POS command
 // printImageBufferToStation already sends on every real print, but on its
 // own with no image/cut, so you can confirm the printer's buzzer works
-// without spending paper on a full test print each time.
-async function testBeep() {
-  const target = printerCache['RECEIPT']
+// without spending paper on a full test print each time. Uses the same
+// BEEP_TIMES / BEEP_LENGTH as real prints, on any configured station.
+async function testBeep(station = 'RECEIPT') {
+  const target = printerCache[station]
   if (!target) {
-    throw new Error(`ບໍ່ໄດ້ຕັ້ງຄ່າ IP ໃຫ້ RECEIPT — ໄປຕັ້ງໃນ /admin/printers`)
+    throw new Error(`ບໍ່ໄດ້ຕັ້ງຄ່າ IP ໃຫ້ ${station} — ໄປຕັ້ງໃນ /admin/printers`)
   }
 
   try {
     const printer = createPrinterForTarget(target)
-    printer.beep()
+    printer.beep(BEEP_TIMES, BEEP_LENGTH)
     await printer.execute()
   } catch (err) {
-    throw new Error(`Beep failed for RECEIPT (${describeTarget(target)}): ${err.message}`)
+    throw new Error(`Beep failed for ${station} (${describeTarget(target)}): ${err.message}`)
   }
 }
 

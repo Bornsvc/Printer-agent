@@ -5,8 +5,9 @@
 //   LAN: every host on this PC's own /24 network(s) with a raw-print port
 //        (9100 by default) accepting TCP connections — what thermal printers
 //        listen on. Only private (RFC 1918) networks are scanned.
-//   USB: Windows COM ports (USB-serial / virtual-COM printer drivers) — the
-//        only kind of USB connection printer.js can print to (\\.\COMx).
+//   USB: Windows COM ports (USB-serial / virtual-COM printer drivers),
+//        printed to as \\.\COMx, plus Windows printers on a USB00x spooler
+//        port (driver-installed, e.g. "POS-80C"), printed to via spooler.js.
 //
 // Results are POSTed to {API_URL}/api/printer-discovery. Runs once on
 // startup and again whenever an admin presses "Scan" (index.js watches the
@@ -138,6 +139,42 @@ function scanComPorts() {
   })
 }
 
+// Windows printers installed with a driver on a USB spooler port (USB001...).
+// These never show up as COM ports. comPort is set to the printer's Windows
+// name — printer.js sends any non-COMx USB target through the spooler, which
+// resolves it by name.
+function scanSpoolerPrinters() {
+  if (process.platform !== 'win32') return Promise.resolve([])
+  const script =
+    "Get-Printer | Where-Object { $_.PortName -match '^USB\\d+' } | " +
+    'Select-Object Name, PortName | ConvertTo-Json -Compress'
+  return new Promise((resolve) => {
+    execFile(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-Command', script],
+      { timeout: 15_000, windowsHide: true },
+      (err, stdout) => {
+        if (err) {
+          console.warn('⚠️  USB printer scan failed:', err.message)
+          return resolve([])
+        }
+        let printers = []
+        try {
+          const parsed = JSON.parse(stdout.trim() || '[]')
+          printers = Array.isArray(parsed) ? parsed : [parsed]
+        } catch {
+          return resolve([])
+        }
+        resolve(
+          printers
+            .filter((p) => p && typeof p.Name === 'string')
+            .map((p) => ({ connectionType: 'USB', comPort: p.Name, name: `${p.Name} (${p.PortName})` }))
+        )
+      }
+    )
+  })
+}
+
 let scanInProgress = null
 
 // Scans and reports. Concurrent callers share one scan instead of starting a
@@ -149,8 +186,8 @@ function runDiscovery(reason) {
     let devices = []
     let error = null
     try {
-      const [lan, usb] = await Promise.all([scanLan(), scanComPorts()])
-      devices = [...lan.devices, ...usb]
+      const [lan, com, spooler] = await Promise.all([scanLan(), scanComPorts(), scanSpoolerPrinters()])
+      devices = [...lan.devices, ...com, ...spooler]
       if (lan.networks.length === 0) error = 'No private IPv4 network found on this PC — LAN printers were not scanned'
       console.log(
         `🔎 Printer scan (${reason}) found ${devices.length} device(s) in ${Date.now() - started}ms` +
@@ -179,4 +216,4 @@ function runDiscovery(reason) {
   return scanInProgress
 }
 
-module.exports = { runDiscovery, scanLan, scanComPorts, localNetworks }
+module.exports = { runDiscovery, scanLan, scanComPorts, scanSpoolerPrinters, localNetworks }
