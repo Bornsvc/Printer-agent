@@ -63,6 +63,8 @@ const LABELS = {
     excludesDrinks: 'ไม่รวมเครื่องดื่ม',
     total: 'รวมทั้งหมด',
     received: 'รับเงิน',
+    cash: 'เงินสด',
+    transfer: 'เงินโอน',
     change: 'เงินทอน',
     scanToPay: 'สแกนเพื่อชำระเงิน',
     thankYou: 'ขอบคุณที่ใช้บริการ',
@@ -91,6 +93,8 @@ const LABELS = {
     excludesDrinks: 'Excludes drinks',
     total: 'Total',
     received: 'Received',
+    cash: 'Cash',
+    transfer: 'Transfer',
     change: 'Change',
     scanToPay: 'Scan to pay',
     thankYou: 'Thank you',
@@ -118,7 +122,9 @@ const LABELS = {
     discount: 'ສ່ວນຫຼຸດ',
     excludesDrinks: 'ບໍ່ລວມເຄື່ອງດື່ມ',
     total: 'ລວມທັງໝົດ',
-    received: 'ຮັບເງິນ',
+    received: 'ຮັບເງິນມາ',
+    cash: 'ເງິນສົດ',
+    transfer: 'ເງິນໂອນ',
     change: 'ເງິນທອນ',
     scanToPay: 'ສະແກນເພື່ອຊຳລະເງິນ',
     thankYou: 'ຂອບໃຈທີ່ໃຊ້ບໍລິການ',
@@ -761,7 +767,12 @@ function layoutReceipt(data, logoDims, qrDims, scale) {
     ops.push({ divider: true, dashed: true, y })
     y += dividerGap
     const code = curCode ? ` ${curCode}` : ''
-    const summary = `${T.received} ${amount(data.received, cur)}${code}, ${T.change} ${amount(data.change ?? 0, cur)}${code}`
+    // How it was paid, e.g. "Received 15,000 LAK (Transfer), Change 0 LAK".
+    // Only the two known methods print; absent/unknown (older app versions)
+    // leaves the line exactly as it was.
+    const method = data.paymentMethod === 'CASH' ? T.cash : data.paymentMethod === 'TRANSFER' ? T.transfer : ''
+    const methodLabel = method ? ` (${method})` : ''
+    const summary = `${T.received} ${amount(data.received, cur)}${code}${methodLabel}, ${T.change} ${amount(data.change ?? 0, cur)}${code}`
     for (const text of wrapText(summary, innerWidth, sz(26))) {
       ops.push({ y, text, opts: { size: sz(26), align: 'center' } })
       y += tableLine
